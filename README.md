@@ -15,3 +15,15 @@ Run `python backtest.py --student A` for a five-year walk-forward comparison. Th
 ## MCP Server
 
 `mcp_server/server.py` exposes the data, signal, portfolio, exit, account, and paper-order tools over FastMCP stdio. Account tools require a student key pair (`ALPACA_KEY_<student>` and `ALPACA_SECRET_<student>`); `place_orders` never submits unless `TRADING_ENABLED=true`, and all clients are paper-only. Run `python scripts/test_mcp.py --student A` to launch an isolated `MCP_DRY_RUN=1` server and call every tool without provider or account side effects.
+
+## CrewAI Agents
+
+`crew/agents.py` defines the Data, signal, news, portfolio, risk, execution, and reporting agents. They use one configured low-temperature LLM and structured `AgentReport` output; numeric evidence comes from MCP tools.
+
+## CrewAI Tasks
+
+`crew/tasks.py` defines the asynchronous signal/news analysis tasks followed by portfolio, risk, execution, and reporting tasks. Each task writes a timestamped Markdown report under `logs/<student>/<run folder>/`; malformed structured output gets one retry, and RiskOfficer must use `validate_portfolio`.
+
+## Crew Runner
+
+`crew/crew.py` selects Groq, Ollama Cloud, or local Ollama in configured order, connects to `mcp_server/server.py` over stdio, and enforces the validator result before execution. Run `python -m crew.crew --student A --mode dry` for a non-submitting run; use `--mode paper` only with `TRADING_ENABLED=true`.

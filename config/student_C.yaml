@@ -14,3 +14,19 @@ risk:
   time_stop_days: 5
   drawdown_breaker_pct: 0.06
   earnings_guard_days: 2
+llm:
+  temperature: 0.1
+  timeout_seconds: 60
+  max_tokens: 1024
+  provider_order: [ollama_local, ollama_cloud, groq]
+  providers:
+    groq:
+      model: openai/gpt-oss-20b
+      base_url: https://api.groq.com/openai/v1
+    ollama_cloud:
+      model: gpt-oss:20b
+      base_url: https://ollama.com/v1
+      api_key_env: OLLAMA_API_KEY
+    ollama_local:
+      model: llama3.2:3b
+      base_url: http://localhost:11434
