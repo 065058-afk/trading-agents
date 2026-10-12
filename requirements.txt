@@ -1,0 +1,16 @@
+alpaca-py
+yfinance
+pandas
+pandas_ta
+numpy
+pyarrow
+scikit-learn
+lightgbm
+crewai
+crewai-tools[mcp]
+mcp
+fastapi
+uvicorn
+python-dotenv
+pyyaml
+requests

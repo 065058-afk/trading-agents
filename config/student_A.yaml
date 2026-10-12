@@ -1,0 +1,16 @@
+student: A
+capital: 100000
+high_beta: [MU, NVDA, TSLA, COIN, UAL]
+diversified: [AAPL, JPM, JNJ, PG, XOM, NEE, CAT, HD, GOOGL, PLD]
+high_beta_share_base: 0.45
+high_beta_share_range: [0.35, 0.55]
+max_position_pct_high_beta: 0.15
+max_position_pct_diversified: 0.10
+min_order_pct: 0.01
+signal_weights: {trend: 0.20, rotation: 0.20, breakout: 0.15, dip: 0.15, ml: 0.20, news: 0.10}
+risk:
+  atr_trailing_stop: 2.5
+  partial_profit_atr: 2.0
+  time_stop_days: 5
+  drawdown_breaker_pct: 0.06
+  earnings_guard_days: 2
