@@ -117,7 +117,7 @@ def test_rotation_scores_are_cached_for_the_iso_week(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(signals, "CACHE_DIR", tmp_path)
 
-    def load_history(requested, as_of=None):
+    def load_history(requested, as_of=None, source=None):
         calls.append(list(requested))
         return frames
 

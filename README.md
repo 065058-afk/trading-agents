@@ -7,3 +7,7 @@
 ## Signals
 
 `mcp_server/signals.py` provides bounded trend, rotation, breakout, dip, LightGBM, and news scores, plus earnings guards and QQQ regime classification. ML runs are retrained with a five-session walk-forward purge and stored as versioned files in `models/`; fold metrics and selected signal direction are appended under `logs/signals/`. News tilt is capped at 0.2 and strongly negative events are exposed through the result's `vetoes` set. Run `python scripts/show_signals.py --student A` to print that student's signal table and current regime. Tests run with `pytest tests/test_signals.py`.
+
+## Backtest
+
+Run `python backtest.py --student A` for a five-year walk-forward comparison. The full strategy uses regime-adaptive configured weights, weekly default rebalancing, transaction costs, and the student's ATR trailing stop, partial-profit, time-stop, and drawdown rules. The legacy comparator uses trend and rotation only, static weights, and no risk overlays. Reports are written to `experiments/` and compare against SPY and an equal-weight buy-and-hold basket. Historical headlines are not cached, so news is held neutral to avoid look-ahead. Use `--years`, `--rebalance-days`, and `--cost-bps` to change the test window and assumptions.

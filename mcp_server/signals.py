@@ -93,9 +93,15 @@ def _cutoff(as_of: date | datetime | pd.Timestamp | None) -> pd.Timestamp | None
 
 
 def _load_history(
-	symbols: Sequence[str], as_of: date | datetime | pd.Timestamp | None = None
+	symbols: Sequence[str],
+	as_of: date | datetime | pd.Timestamp | None = None,
+	source: Mapping[str, pd.DataFrame] | None = None,
 ) -> dict[str, pd.DataFrame]:
-	frames = history_cache(list(symbols))
+	frames: Mapping[str, pd.DataFrame]
+	if source is None:
+		frames = history_cache(list(symbols))
+	else:
+		frames = source
 	cutoff = _cutoff(as_of)
 	result: dict[str, pd.DataFrame] = {}
 	for symbol, source in frames.items():
@@ -128,11 +134,14 @@ def _zero_scores(symbols: Sequence[str]) -> dict[str, float]:
 
 
 def signal_trend(
-	symbols: Sequence[str], *, as_of: date | datetime | pd.Timestamp | None = None
+	symbols: Sequence[str],
+	*,
+	as_of: date | datetime | pd.Timestamp | None = None,
+	history: Mapping[str, pd.DataFrame] | None = None,
 ) -> dict[str, float]:
 	"""Score EMA20/EMA50 alignment, filtered by ADX and ATR-sized with a 0.25 floor."""
 	requested = _symbols(symbols)
-	frames = _load_history(requested, as_of)
+	frames = _load_history(requested, as_of, history)
 	scores = _zero_scores(requested)
 	for symbol in requested:
 		frame = frames.get(symbol)
@@ -214,22 +223,25 @@ def _rotation_week(as_of: date | datetime | pd.Timestamp | None = None) -> str:
 
 
 def signal_rotation(
-	symbols: Sequence[str], *, as_of: date | datetime | pd.Timestamp | None = None
+	symbols: Sequence[str],
+	*,
+	as_of: date | datetime | pd.Timestamp | None = None,
+	history: Mapping[str, pd.DataFrame] | None = None,
 ) -> dict[str, float]:
 	"""Rank 20/60-day relative returns and 52-week-high proximity; persist weekly."""
 	requested = _symbols(symbols)
 	week = _rotation_week(as_of)
 	cache_path = CACHE_DIR / "rotation_weekly.json"
-	if as_of is None and cache_path.exists():
+	if as_of is None and history is None and cache_path.exists():
 		try:
 			cached = json.loads(cache_path.read_text(encoding="utf-8"))
 			if cached.get("week") == week and cached.get("symbols") == requested:
 				return {symbol: _score(cached["scores"].get(symbol, 0.0)) for symbol in requested}
 		except (OSError, ValueError, TypeError):
 			pass
-	frames = _load_history([*requested, "SPY"], as_of)
+	frames = _load_history([*requested, "SPY"], as_of, history)
 	scores = _rotation_scores(requested, frames)
-	if as_of is None:
+	if as_of is None and history is None:
 		cache_path.parent.mkdir(parents=True, exist_ok=True)
 		temporary_path = cache_path.with_suffix(".tmp")
 		temporary_path.write_text(
@@ -240,11 +252,14 @@ def signal_rotation(
 
 
 def signal_breakout(
-	symbols: Sequence[str], *, as_of: date | datetime | pd.Timestamp | None = None
+	symbols: Sequence[str],
+	*,
+	as_of: date | datetime | pd.Timestamp | None = None,
+	history: Mapping[str, pd.DataFrame] | None = None,
 ) -> dict[str, float]:
 	"""Reward a 20-day closing high with above-average volume and ATR expansion."""
 	requested = _symbols(symbols)
-	frames = _load_history(requested, as_of)
+	frames = _load_history(requested, as_of, history)
 	scores = _zero_scores(requested)
 	for symbol in requested:
 		frame = frames.get(symbol)
@@ -271,11 +286,14 @@ def signal_breakout(
 
 
 def signal_dip(
-	symbols: Sequence[str], *, as_of: date | datetime | pd.Timestamp | None = None
+	symbols: Sequence[str],
+	*,
+	as_of: date | datetime | pd.Timestamp | None = None,
+	history: Mapping[str, pd.DataFrame] | None = None,
 ) -> dict[str, float]:
 	"""Score active two-day, 2-ATR pullbacks above EMA50 until a defined exit."""
 	requested = _symbols(symbols)
-	frames = _load_history(requested, as_of)
+	frames = _load_history(requested, as_of, history)
 	scores = _zero_scores(requested)
 	for symbol in requested:
 		frame = frames.get(symbol)
@@ -422,14 +440,18 @@ def _record_ml_run(
 
 
 def signal_ml(
-	symbols: Sequence[str], *, as_of: date | datetime | pd.Timestamp | None = None
+	symbols: Sequence[str],
+	*,
+	as_of: date | datetime | pd.Timestamp | None = None,
+	history: Mapping[str, pd.DataFrame] | None = None,
+	persist: bool = True,
 ) -> dict[str, float]:
 	"""Train a seeded LightGBM walk-forward model on 14 causal features and predict."""
 	from lightgbm import LGBMRegressor
 	import joblib
 
 	requested = _symbols(symbols)
-	frames = _load_history(requested, as_of)
+	frames = _load_history(requested, as_of, history)
 	blocks: list[pd.DataFrame] = []
 	current_features: dict[str, pd.Series] = {}
 	validation_scale_values: list[float] = []
@@ -473,11 +495,12 @@ def signal_ml(
 		verbosity=-1,
 	)
 	model.fit(train.loc[:, FEATURE_COLUMNS], train["target"])
-	MODEL_DIR.mkdir(parents=True, exist_ok=True)
-	version = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-	model_path = MODEL_DIR / f"lightgbm_signal_{version}.joblib"
-	joblib.dump({"model": model, "features": list(FEATURE_COLUMNS), "signal_sign": sign}, model_path)
-	_record_ml_run(metrics, sign, model_path)
+	if persist:
+		MODEL_DIR.mkdir(parents=True, exist_ok=True)
+		version = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+		model_path = MODEL_DIR / f"lightgbm_signal_{version}.joblib"
+		joblib.dump({"model": model, "features": list(FEATURE_COLUMNS), "signal_sign": sign}, model_path)
+		_record_ml_run(metrics, sign, model_path)
 	all_targets = panel["target"].abs().to_numpy(dtype=float)
 	scale = float(np.nanmedian(all_targets)) if len(all_targets) else 0.02
 	if not np.isfinite(scale) or scale < 1e-4:
@@ -735,10 +758,12 @@ def earnings_guard(symbols: Sequence[str], days: int) -> list[str]:
 
 
 def regime_state(
-	*, as_of: date | datetime | pd.Timestamp | None = None
+	*,
+	as_of: date | datetime | pd.Timestamp | None = None,
+	history: Mapping[str, pd.DataFrame] | None = None,
 ) -> str:
 	"""Classify QQQ as risk_on, risk_off, or neutral from moving averages and volatility."""
-	frames = _load_history(["QQQ"], as_of)
+	frames = _load_history(["QQQ"], as_of, history)
 	frame = frames.get("QQQ")
 	if frame is None or len(frame) < 20:
 		return "neutral"
