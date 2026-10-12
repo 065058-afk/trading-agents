@@ -11,3 +11,7 @@
 ## Backtest
 
 Run `python backtest.py --student A` for a five-year walk-forward comparison. The full strategy uses regime-adaptive configured weights, weekly default rebalancing, transaction costs, and the student's ATR trailing stop, partial-profit, time-stop, and drawdown rules. The legacy comparator uses trend and rotation only, static weights, and no risk overlays. Reports are written to `experiments/` and compare against SPY and an equal-weight buy-and-hold basket. Historical headlines are not cached, so news is held neutral to avoid look-ahead. Use `--years`, `--rebalance-days`, and `--cost-bps` to change the test window and assumptions.
+
+## MCP Server
+
+`mcp_server/server.py` exposes the data, signal, portfolio, exit, account, and paper-order tools over FastMCP stdio. Account tools require a student key pair (`ALPACA_KEY_<student>` and `ALPACA_SECRET_<student>`); `place_orders` never submits unless `TRADING_ENABLED=true`, and all clients are paper-only. Run `python scripts/test_mcp.py --student A` to launch an isolated `MCP_DRY_RUN=1` server and call every tool without provider or account side effects.
