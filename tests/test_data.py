@@ -48,6 +48,7 @@ def test_history_cache_second_run_makes_no_yahoo_downloads(monkeypatch, tmp_path
     assert set(first) == set(symbols)
     assert set(second) == set(symbols)
     assert len(calls) == 1
+    assert calls[0]["tickers"] == symbols
     assert all((tmp_path / f"{symbol}.parquet").exists() for symbol in symbols)
 
 
@@ -91,7 +92,8 @@ def test_get_ohlcv_batch_makes_one_iex_request(monkeypatch):
 
     result = data.get_ohlcv_batch(["AAPL", "MSFT"], 30)
 
-    assert result is bars
+    assert list(result.columns) == ["symbol", "timestamp", *data.OHLCV_COLUMNS]
+    assert set(result["symbol"]) == set(requested_symbols)
     assert call_count == 1
     assert captured["request"].symbol_or_symbols == requested_symbols
     assert captured["request"].feed == "iex"
@@ -115,4 +117,14 @@ def test_get_ohlcv_batch_makes_one_iex_request(monkeypatch):
 )
 def test_data_quality_errors_are_clear(frame, message):
     with pytest.raises(data.DataQualityError, match=message):
-        data._check_recent_data("AAPL", data._normalize_ohlcv(frame))
+        data.check_data(frame)
+
+
+def test_old_historical_gaps_do_not_reject_recent_data():
+    historical = _recent_frame(
+        pd.DatetimeIndex(["2001-09-10", "2001-09-17"])
+    )
+    recent = _recent_frame(_recent_sessions(24))
+    frame = pd.concat([historical, recent]).sort_index()
+
+    data.check_data(frame)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import re
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Sequence
 from zoneinfo import ZoneInfo
@@ -15,6 +15,7 @@ from pandas.tseries.holiday import GoodFriday, USFederalHolidayCalendar
 CACHE_DIR = Path(__file__).resolve().parents[1] / "data" / "cache"
 OHLCV_COLUMNS = ("open", "high", "low", "close", "volume")
 MAX_STALE_DAYS = 5
+GAP_CHECK_DAYS = 30
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9.-]*$")
 
 
@@ -78,7 +79,10 @@ def _market_holidays(start: date, end: date) -> set[date]:
 
 
 def _latest_expected_session(today: date | None = None) -> date:
-	current = today or datetime.now(ZoneInfo("America/New_York")).date()
+	now = datetime.now(ZoneInfo("America/New_York"))
+	current = today or now.date()
+	if today is None and now.time() < time(17):
+		current -= timedelta(days=1)
 	holidays = _market_holidays(current - timedelta(days=14), current)
 	while current.weekday() >= 5 or current in holidays:
 		current -= timedelta(days=1)
@@ -96,11 +100,14 @@ def _check_recent_data(symbol: str, frame: pd.DataFrame) -> None:
 			f"{symbol}: latest bar is stale ({latest.isoformat()}, {age} days old)"
 		)
 
-	first_check_date = frame.index.min().date()
-	holidays = _market_holidays(first_check_date, latest)
+	last_expected_session = min(latest, _latest_expected_session())
+	first_check_date = max(
+		frame.index.min().date(), last_expected_session - timedelta(days=GAP_CHECK_DAYS)
+	)
+	holidays = _market_holidays(first_check_date, last_expected_session)
 	expected = {
 		day.date()
-		for day in pd.date_range(first_check_date, latest, freq="B")
+		for day in pd.date_range(first_check_date, last_expected_session, freq="B")
 		if day.date() not in holidays
 	}
 	actual = {pd.Timestamp(day).date() for day in frame.index}
@@ -184,10 +191,77 @@ def _bars_by_symbol(bars: pd.DataFrame, symbols: Sequence[str]) -> dict[str, pd.
 	return {}
 
 
+def _frames_for_check(frame: pd.DataFrame) -> dict[str, pd.DataFrame]:
+	if frame.empty:
+		return {}
+	if isinstance(frame.index, pd.MultiIndex):
+		symbol_level = next(
+			(level for level, name in enumerate(frame.index.names) if name and name.lower() == "symbol"),
+			0,
+		)
+		symbols = frame.index.get_level_values(symbol_level).unique()
+		return _bars_by_symbol(frame, [str(symbol) for symbol in symbols])
+	if "symbol" in frame.columns:
+		return {
+			str(symbol).upper(): rows.drop(columns="symbol").copy()
+			for symbol, rows in frame.groupby("symbol")
+		}
+	return {"dataframe": frame.copy()}
+
+
+def check_data(df: pd.DataFrame) -> None:
+	"""Raise DataQualityError if any represented symbol has empty, stale, or gapped bars."""
+	if df.empty:
+		raise DataQualityError("no recent bar was returned for any symbol")
+	grouped = _frames_for_check(df)
+	if not grouped:
+		raise DataQualityError("no recent bar was returned for any symbol")
+	for symbol, frame in grouped.items():
+		if "timestamp" in frame.columns:
+			frame = frame.set_index("timestamp")
+		_check_recent_data(symbol, _normalize_ohlcv(frame))
+
+
+def _ohlcv_table(bars: pd.DataFrame, requested: Sequence[str]) -> pd.DataFrame:
+	if isinstance(bars.index, pd.MultiIndex):
+		index_names = list(bars.index.names)
+		reset = bars.reset_index()
+		reset_names = list(reset.columns[: len(index_names)])
+		symbol_level = next(
+			(level for level, name in enumerate(index_names) if name and name.lower() == "symbol"),
+			0,
+		)
+		timestamp_level = next((level for level in range(len(index_names)) if level != symbol_level), None)
+		if timestamp_level is None:
+			raise DataQualityError("Alpaca bars are missing timestamps")
+			reset = reset.rename(
+				columns={reset_names[symbol_level]: "symbol", reset_names[timestamp_level]: "timestamp"}
+			)
+	else:
+		reset = bars.copy()
+		if "timestamp" not in reset.columns:
+			reset = reset.reset_index()
+			reset = reset.rename(columns={reset.columns[0]: "timestamp"})
+		if "symbol" not in reset.columns:
+			if len(requested) != 1:
+				raise DataQualityError("Alpaca bars are missing symbol identifiers")
+			reset["symbol"] = requested[0]
+
+	reset.columns = [str(column).strip().lower() for column in reset.columns]
+	columns = ["symbol", "timestamp", *OHLCV_COLUMNS]
+	missing = [column for column in columns if column not in reset.columns]
+	if missing:
+		raise DataQualityError(f"Alpaca bars are missing required columns: {', '.join(missing)}")
+	table = reset.loc[:, columns].copy()
+	table["symbol"] = table["symbol"].astype(str).str.upper()
+	table["timestamp"] = pd.to_datetime(table["timestamp"])
+	return table.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
+
+
 def get_ohlcv_batch(
 	symbols: Sequence[str], days: int, *, student: str = "A"
 ) -> pd.DataFrame:
-	"""Fetch and validate daily IEX bars for all symbols in one Alpaca request."""
+	"""Fetch daily IEX bars in one request and return one table for all symbols."""
 	requested = _normalize_symbols(symbols)
 	if isinstance(days, bool) or not isinstance(days, int) or days < 1:
 		raise ValueError("days must be a positive integer")
@@ -216,9 +290,6 @@ def get_ohlcv_batch(
 	for symbol in requested:
 		if symbol not in grouped:
 			raise DataQualityError(f"{symbol}: no recent bar was returned")
-		frame = grouped[symbol]
-		if "timestamp" in frame.columns:
-			frame = frame.set_index("timestamp")
-		frame = _normalize_ohlcv(frame)
-		_check_recent_data(symbol, frame)
-	return bars
+	table = _ohlcv_table(bars, requested)
+	check_data(table)
+	return table
