@@ -99,6 +99,27 @@ def test_provider_uses_groq_model_environment_override_first(monkeypatch):
 	assert selection.model == "openai/gpt-oss-120b"
 
 
+def test_provider_prefers_local_ollama_when_available_even_with_groq_key(monkeypatch):
+	monkeypatch.setenv("GROQ_API_KEY", "groq-test-key")
+	monkeypatch.setenv("OLLAMA_API_KEY", "ollama-test-key")
+	monkeypatch.setattr(
+		"crew.crew._model_available",
+		lambda provider, *args: provider == "ollama_local" or provider == "groq",
+	)
+	settings = {
+		"provider_order": ["ollama_local", "groq"],
+		"providers": {
+			"groq": {"model": "openai/gpt-oss-20b", "base_url": "https://api.groq.test/v1"},
+			"ollama_local": {"model": "qwen3:0.6b", "base_url": "http://localhost:11434"},
+		},
+	}
+
+	selection = select_provider(settings)
+
+	assert selection.name == "ollama_local"
+	assert selection.model == "qwen3:0.6b"
+
+
 def test_student_configs_prefer_installed_local_free_model():
 	for student in ("A", "B", "C"):
 		llm_config = _read_config(student)["llm"]

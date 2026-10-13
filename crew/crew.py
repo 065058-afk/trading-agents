@@ -194,18 +194,17 @@ def _model_available(provider: str, model: str, base_url: str, api_key: str | No
 
 
 def select_provider(config: Mapping[str, Any]) -> ProviderSelection:
-	"""Select the first reachable, configured provider without exposing credentials."""
+	"""Select the first reachable provider in the configured order without exposing credentials."""
 	settings = config.get("llm", config)
-	provider_order = settings.get("provider_order", ["groq", "ollama_cloud", "ollama_local"])
+	provider_order = list(settings.get("provider_order", ["groq", "ollama_cloud", "ollama_local"]))
 	providers = settings.get("providers")
 	if not isinstance(providers, Mapping):
 		providers = {name: settings.get(name, {}) for name in provider_order}
-	if os.environ.get("GROQ_API_KEY") and "groq" in providers:
-		provider_order = ["groq", *(name for name in provider_order if name != "groq")]
+
 	for name in provider_order:
 		provider = providers.get(name, {})
 		model = str(
-			os.environ.get("GROQ_MODEL", "").strip() or provider.get("model", "")
+			(os.environ.get("GROQ_MODEL", "").strip() or provider.get("model", ""))
 			if name == "groq"
 			else provider.get("model", "")
 		).strip()
