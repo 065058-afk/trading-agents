@@ -28,6 +28,22 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
+      - name: Start Ollama and pull Qwen
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama serve > /tmp/ollama.log 2>&1 &
+          for attempt in {1..30}; do
+            if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:11434/api/tags >/dev/null || {
+            echo "Ollama failed to start"
+            cat /tmp/ollama.log
+            exit 1
+          }
+          ollama pull qwen3:1.7b
       - name: Run all students
         env:
           ALPACA_KEY_A: ${{ secrets.ALPACA_KEY_A }}

@@ -4,6 +4,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 from crew.agents import AgentReport, create_agents
 from crew.crew import (
@@ -124,7 +125,7 @@ def test_student_configs_prefer_installed_local_free_model():
 	for student in ("A", "B", "C"):
 		llm_config = _read_config(student)["llm"]
 		assert llm_config["provider_order"][0] == "ollama_local"
-		assert llm_config["providers"]["ollama_local"]["model"] == "qwen3:0.6b"
+		assert llm_config["providers"]["ollama_local"]["model"] == "qwen3:1.7b"
 		assert llm_config["max_tokens"] == 1024
 
 
@@ -168,7 +169,10 @@ def test_groq_gpt_oss_uses_low_reasoning_effort():
 	llm = _create_llm(selection, 0.1, 30)
 
 	assert llm.reasoning_effort == "low"
-	assert llm.max_tokens == 160
+	assert llm.max_tokens == 1024
+
+	plain_llm = _create_llm(selection, 0.1, 30, structured=False)
+	assert plain_llm.response_format is None
 
 
 class MockHTTPError(Exception):
@@ -197,9 +201,11 @@ class FakeLLM:
 	def __init__(self, responses):
 		self.responses = list(responses)
 		self.calls = 0
+		self.response_models = []
 
-	def call(self, prompt, *, response_model):
+	def call(self, prompt, *, response_model=None):
 		self.calls += 1
+		self.response_models.append(response_model)
 		response = self.responses.pop(0)
 		if isinstance(response, Exception):
 			raise response
@@ -280,7 +286,10 @@ def test_groq_400_retries_then_falls_back_to_ollama_cloud(monkeypatch):
 def test_groq_schema_failures_retry_without_strict_response_model(monkeypatch):
 	monkeypatch.setenv("GROQ_MODEL_FALLBACK", "openai/gpt-oss-120b")
 	selection = ProviderSelection("groq", "openai/gpt-oss-20b", "https://api.groq.test/v1", "groq-test-key")
-	provider_model = FakeLLM([MockHTTPError(400), '{"status":"complete","decision":"approve","summary":"Recovered via plain text","observations":[],"blockers":[]}'])
+	provider_model = FakeLLM([
+		MockHTTPError(400, message="json_validate_failed: failed to generate JSON"),
+		'{"status":"complete","decision":"approve","summary":"Recovered via plain text","observations":[],"blockers":[]}',
+	])
 	monkeypatch.setattr(
 		"crew.crew._create_llm",
 		lambda candidate, *args: provider_model,
@@ -294,6 +303,70 @@ def test_groq_schema_failures_retry_without_strict_response_model(monkeypatch):
 	assert unavailable is None
 	assert provider == "groq"
 	assert provider_model.calls == 2
+	assert provider_model.response_models == [AgentReport, None]
+
+
+def test_length_finish_error_retries_without_structured_output(monkeypatch):
+	selection = ProviderSelection("ollama_local", "qwen3:0.6b", "http://localhost:11434", None)
+	length_error = type("LengthFinishReasonError", (Exception,), {})("completion reached its token limit")
+	provider_model = FakeLLM([
+		length_error,
+		'{"status":"complete","decision":"approve","summary":"Recovered from truncation","observations":[],"blockers":[]}',
+	])
+	monkeypatch.setattr("crew.crew._create_llm", lambda candidate, *args: provider_model)
+
+	report, unavailable, provider = _call_agent_report(
+		selection, _fallback_settings(), "short prompt", FakeLimiter(), {}
+	)
+
+	assert report["summary"] == "Recovered from truncation"
+	assert unavailable is None
+	assert provider == "ollama_local"
+	assert provider_model.response_models == [AgentReport, None]
+
+
+def test_invalid_plain_text_report_degrades_to_warning(monkeypatch):
+	selection = ProviderSelection("ollama_local", "qwen3:1.7b", "http://localhost:11434", None)
+	with pytest.raises(ValidationError) as validation_error:
+		AgentReport.model_validate({})
+	provider_model = FakeLLM([validation_error.value, "This is not a valid report."])
+	monkeypatch.setattr("crew.crew._create_llm", lambda candidate, *args: provider_model)
+
+	report, unavailable, provider = _call_agent_report(
+		selection, _fallback_settings(), "short prompt", FakeLimiter(), {}
+	)
+
+	assert report["status"] == "warning"
+	assert report["decision"] == "not_applicable"
+	assert "MCP results are retained" in report["blockers"][0]
+	assert unavailable is None
+	assert provider == "ollama_local"
+
+
+def test_agent_report_uses_configured_completion_token_limit(monkeypatch):
+	selection = ProviderSelection("groq", "openai/gpt-oss-20b", "https://api.groq.test/v1", "groq-test-key")
+	settings = _fallback_settings()
+	settings["max_tokens"] = 768
+	created_with = []
+
+	def create_llm(candidate, temperature, timeout, max_tokens):
+		created_with.append(max_tokens)
+		return FakeLLM([
+			AgentReport(status="complete", decision="approve", summary="Token cap respected.")
+		])
+
+	monkeypatch.setattr("crew.crew._create_llm", create_llm)
+	limiter = FakeLimiter()
+
+	report, unavailable, provider = _call_agent_report(
+		selection, settings, "short prompt", limiter, {}
+	)
+
+	assert report["summary"] == "Token cap respected."
+	assert unavailable is None
+	assert provider == "groq"
+	assert created_with == [768]
+	assert limiter.reservations == [("short prompt", 768)]
 
 
 def test_retry_after_reads_numeric_header_and_short_error_hides_key():

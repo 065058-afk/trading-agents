@@ -28,5 +28,5 @@ llm:
       base_url: https://ollama.com/v1
       api_key_env: OLLAMA_API_KEY
     ollama_local:
-      model: qwen3:0.6b
+      model: qwen3:1.7b
       base_url: http://localhost:11434

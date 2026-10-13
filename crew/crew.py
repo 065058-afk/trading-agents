@@ -27,6 +27,7 @@ from crewai.tools import tool
 from crewai_tools import MCPServerAdapter
 from dotenv import load_dotenv
 from mcp import StdioServerParameters
+from pydantic import ValidationError
 
 if __package__ in {None, ""}:
 	ROOT = Path(__file__).resolve().parents[1]
@@ -44,7 +45,7 @@ LOG_ROOT = ROOT / "logs"
 SERVER_PATH = ROOT / "mcp_server" / "server.py"
 LOGGER = logging.getLogger("trading_crew")
 GROQ_TOKENS_PER_MINUTE = 8_000
-LLM_MAX_TOKENS = 160
+LLM_MAX_TOKENS = 1_024
 
 
 @dataclass(frozen=True)
@@ -224,13 +225,17 @@ def select_provider(config: Mapping[str, Any]) -> ProviderSelection:
 
 
 def _create_llm(
-	selection: ProviderSelection, temperature: float, timeout: int, max_tokens: int = LLM_MAX_TOKENS
+	selection: ProviderSelection,
+	temperature: float,
+	timeout: int,
+	max_tokens: int = LLM_MAX_TOKENS,
+	structured: bool = True,
 ) -> LLM:
+	options: dict[str, Any] = {"response_format": AgentReport} if structured else {}
 	if selection.name in {"groq", "ollama_cloud"}:
 		base_url = selection.base_url
 		if selection.name == "ollama_cloud" and not base_url.rstrip("/").endswith("/v1"):
 			base_url = base_url.rstrip("/") + "/v1"
-		options: dict[str, Any] = {}
 		if selection.name == "groq" and "gpt-oss" in selection.model.lower():
 			options["reasoning_effort"] = "low"
 		return LLM(
@@ -240,7 +245,6 @@ def _create_llm(
 			temperature=temperature,
 			timeout=timeout,
 			max_tokens=max_tokens,
-			response_format=AgentReport,
 			**options,
 		)
 	return LLM(
@@ -249,7 +253,7 @@ def _create_llm(
 		temperature=temperature,
 		timeout=timeout,
 		max_tokens=max_tokens,
-		response_format=AgentReport,
+		**options,
 	)
 
 
@@ -315,6 +319,18 @@ def _short_llm_error(error: Exception, provider: str) -> str:
 	return f"{provider} HTTP {status}" if status is not None else f"{provider} {type(error).__name__}"
 
 
+def _is_structured_output_error(error: Exception) -> bool:
+	message = str(error).lower()
+	return isinstance(error, ValidationError) or type(error).__name__ == "LengthFinishReasonError" or any(
+		phrase in message
+		for phrase in (
+			"json_validate_failed",
+			"failed to generate json",
+			"max completion tokens reached before generating a valid document",
+		)
+	)
+
+
 def _parse_agent_report(result: Any) -> dict[str, Any]:
 	if isinstance(result, AgentReport):
 		return result.model_dump(mode="json")
@@ -342,6 +358,7 @@ def _call_agent_report(
 	last_reason = "No configured LLM provider is reachable"
 	for candidate_index, candidate in enumerate(candidates):
 		key = (candidate.name, candidate.model)
+		max_tokens = int(settings.get("max_tokens", LLM_MAX_TOKENS))
 		try:
 			llm = llm_cache.get(key)
 			if llm is None:
@@ -349,7 +366,7 @@ def _call_agent_report(
 					candidate,
 					float(settings.get("temperature", 0.1)),
 					int(settings.get("timeout_seconds", 30)),
-					LLM_MAX_TOKENS,
+					max_tokens,
 				)
 				llm_cache[key] = llm
 		except Exception as error:
@@ -358,21 +375,38 @@ def _call_agent_report(
 		attempts = 2 if candidate_index == 0 else 1
 		for attempt in range(attempts):
 			try:
-				limiter.reserve(prompt, LLM_MAX_TOKENS)
+				limiter.reserve(prompt, max_tokens)
 				result = llm.call(prompt, response_model=AgentReport)
 				return _parse_agent_report(result), None, candidate.name
 			except Exception as error:
 				status = _http_status(error)
 				last_reason = _short_llm_error(error, candidate.name)
+				if _is_structured_output_error(error):
+					try:
+						limiter.reserve(prompt, max_tokens)
+						plain_llm = _create_llm(
+							candidate,
+							float(settings.get("temperature", 0.1)),
+							int(settings.get("timeout_seconds", 30)),
+							max_tokens,
+							False,
+						)
+						plain_text = plain_llm.call(prompt)
+						return _parse_agent_report(plain_text), None, candidate.name
+					except Exception as fallback_error:
+						last_reason = _short_llm_error(fallback_error, candidate.name)
+						if isinstance(fallback_error, ValidationError):
+							warning_report = AgentReport(
+								status="warning",
+								decision="not_applicable",
+								summary="LLM commentary did not match the required schema.",
+								blockers=["Authoritative MCP results are retained; commentary was not used."],
+							)
+							return warning_report.model_dump(mode="json"), None, candidate.name
+						break
 				if attempt == 0 and attempts == 2 and status in {400, 429}:
 					if status == 429:
 						limiter.wait_for_retry_after(_retry_after_seconds(error) or 1.0)
-					try:
-						plain_text = llm.call(prompt)
-						parsed = _parse_agent_report(plain_text)
-						return parsed, None, candidate.name
-					except Exception:
-						pass
 					continue
 				break
 	return None, last_reason, None
