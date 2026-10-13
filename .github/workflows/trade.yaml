@@ -1,0 +1,53 @@
+name: trade
+on:
+  schedule:
+    - cron: "0 14 * * 1-5"   # 10:00 ET in daylight time
+    - cron: "0 15 * * 1-5"   # 10:00 ET in standard time
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "dry or live"
+        default: "dry"
+concurrency:
+  group: trade
+  cancel-in-progress: false
+permissions:
+  contents: write
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run all students
+        env:
+          ALPACA_KEY_A: ${{ secrets.ALPACA_KEY_A }}
+          ALPACA_SECRET_A: ${{ secrets.ALPACA_SECRET_A }}
+          ALPACA_KEY_B: ${{ secrets.ALPACA_KEY_B }}
+          ALPACA_SECRET_B: ${{ secrets.ALPACA_SECRET_B }}
+          ALPACA_KEY_C: ${{ secrets.ALPACA_KEY_C }}
+          ALPACA_SECRET_C: ${{ secrets.ALPACA_SECRET_C }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          TRADING_ENABLED: ${{ vars.TRADING_ENABLED }}
+          MODE: ${{ github.event.inputs.mode || 'live' }}
+        run: |
+          status=0
+          for s in A B C; do
+            python run_cycle.py --student $s --mode $MODE || status=1
+          done
+          exit $status
+      - name: Save logs, cache and models
+        if: always()
+        run: |
+          git config user.name "trade-bot"
+          git config user.email "trade-bot@users.noreply.github.com"
+          git add logs data models experiments
+          git diff --cached --quiet || git commit -m "run $(date -u +%F) [skip ci]"
+          git pull --rebase
+          git push
