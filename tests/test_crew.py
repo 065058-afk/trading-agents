@@ -125,7 +125,7 @@ def test_student_configs_prefer_installed_local_free_model():
 	for student in ("A", "B", "C"):
 		llm_config = _read_config(student)["llm"]
 		assert llm_config["provider_order"][0] == "ollama_local"
-		assert llm_config["providers"]["ollama_local"]["model"] == "qwen3:1.7b"
+		assert llm_config["providers"]["ollama_local"]["model"] == "qwen3:0.6b"
 		assert llm_config["max_tokens"] == 1024
 
 
@@ -326,7 +326,7 @@ def test_length_finish_error_retries_without_structured_output(monkeypatch):
 
 
 def test_invalid_plain_text_report_degrades_to_warning(monkeypatch):
-	selection = ProviderSelection("ollama_local", "qwen3:1.7b", "http://localhost:11434", None)
+	selection = ProviderSelection("ollama_local", "qwen3:0.6b", "http://localhost:11434", None)
 	with pytest.raises(ValidationError) as validation_error:
 		AgentReport.model_validate({})
 	provider_model = FakeLLM([validation_error.value, "This is not a valid report."])

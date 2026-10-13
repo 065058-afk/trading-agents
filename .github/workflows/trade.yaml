@@ -43,7 +43,7 @@ jobs:
             cat /tmp/ollama.log
             exit 1
           }
-          ollama pull qwen3:1.7b
+          ollama pull qwen3:0.6b
       - name: Run all students
         env:
           ALPACA_KEY_A: ${{ secrets.ALPACA_KEY_A }}
