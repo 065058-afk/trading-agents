@@ -46,6 +46,7 @@ SERVER_PATH = ROOT / "mcp_server" / "server.py"
 LOGGER = logging.getLogger("trading_crew")
 GROQ_TOKENS_PER_MINUTE = 8_000
 LLM_MAX_TOKENS = 1_024
+QWEN3_MAX_TOKENS = 2_048
 
 
 @dataclass(frozen=True)
@@ -361,6 +362,8 @@ def _call_agent_report(
 	for candidate_index, candidate in enumerate(candidates):
 		key = (candidate.name, candidate.model)
 		max_tokens = int(settings.get("max_tokens", LLM_MAX_TOKENS))
+		if candidate.name == "ollama_local" and candidate.model.lower().startswith("qwen3"):
+			max_tokens = max(max_tokens, QWEN3_MAX_TOKENS)
 		try:
 			llm = llm_cache.get(key)
 			if llm is None:

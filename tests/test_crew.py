@@ -377,6 +377,31 @@ def test_agent_report_uses_configured_completion_token_limit(monkeypatch):
 	assert limiter.reservations == [("short prompt", 768)]
 
 
+def test_local_qwen3_uses_higher_completion_limit(monkeypatch):
+	selection = ProviderSelection("ollama_local", "qwen3:0.6b", "http://localhost:11434", None)
+	settings = _fallback_settings()
+	settings["max_tokens"] = 1024
+	created_with = []
+
+	def create_llm(candidate, temperature, timeout, max_tokens):
+		created_with.append(max_tokens)
+		return FakeLLM([
+			AgentReport(status="complete", decision="approve", summary="Qwen output fits.")
+		])
+
+	monkeypatch.setattr("crew.crew._create_llm", create_llm)
+	limiter = FakeLimiter()
+
+	_report, unavailable, provider = _call_agent_report(
+		selection, settings, "short prompt", limiter, {}
+	)
+
+	assert unavailable is None
+	assert provider == "ollama_local"
+	assert created_with == [2048]
+	assert limiter.reservations == [("short prompt", 2048)]
+
+
 def test_retry_after_reads_numeric_header_and_short_error_hides_key():
 	error = MockHTTPError(429, 4, "request failed with groq-secret")
 
