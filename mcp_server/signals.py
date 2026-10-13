@@ -445,6 +445,7 @@ def signal_ml(
 	as_of: date | datetime | pd.Timestamp | None = None,
 	history: Mapping[str, pd.DataFrame] | None = None,
 	persist: bool = True,
+	walk_forward: bool = True,
 ) -> dict[str, float]:
 	"""Train a seeded LightGBM walk-forward model on 14 causal features and predict."""
 	from lightgbm import LGBMRegressor
@@ -475,7 +476,7 @@ def signal_ml(
 	panel = panel.dropna(subset=[*FEATURE_COLUMNS, "target"])
 	if panel.empty:
 		return _zero_scores(requested)
-	metrics, sign = _walk_forward_folds(panel)
+	metrics, sign = _walk_forward_folds(panel) if walk_forward else ([], 1)
 	for metric in metrics:
 		if metric["ic"] is not None:
 			validation_scale_values.append(float(metric["ic"]))

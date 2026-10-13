@@ -10,7 +10,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import requests
 import yaml
@@ -154,14 +154,38 @@ def _call_tool(tool_map: Mapping[str, Any], name: str, **arguments: Any) -> Any:
 	return _decode_tool_result(tool.run(**arguments))
 
 
-def _create_risk_validation_tool(mcp_tool: Any) -> Any:
+def _dry_blend_scores(student: str, symbols: list[str]) -> dict[str, Any]:
+	previous_dry_run = os.environ.get("MCP_DRY_RUN")
+	os.environ["MCP_DRY_RUN"] = "1"
+	try:
+		from mcp_server.server import blend_scores
+
+		return blend_scores(student, symbols)
+	finally:
+		if previous_dry_run is None:
+			os.environ.pop("MCP_DRY_RUN", None)
+		else:
+			os.environ["MCP_DRY_RUN"] = previous_dry_run
+
+
+def _create_risk_validation_tool(mcp_tool: Any, breaker_allows_reduced_exposure: bool = False) -> Any:
 	@tool("validate_portfolio")
-	def validate_portfolio(student: str, target_weights_json: str, dry_run: bool) -> str:
+	def validate_portfolio(
+		student: str,
+		target_weights_json: str,
+		dry_run: bool,
+		allow_reduced_exposure: bool = False,
+	) -> str:
 		"""Validate JSON-encoded target weights with the local MCP portfolio validator."""
 		weights = json.loads(target_weights_json)
 		if not isinstance(weights, dict):
 			raise ValueError("target_weights_json must encode a JSON object")
-		result = mcp_tool.run(student=student, target_weights=weights, dry_run=dry_run)
+		result = mcp_tool.run(
+			student=student,
+			target_weights=weights,
+			dry_run=dry_run,
+			allow_reduced_exposure=(breaker_allows_reduced_exposure and allow_reduced_exposure),
+		)
 		return json.dumps(_decode_tool_result(result), ensure_ascii=True, default=str)
 
 	return validate_portfolio
@@ -179,6 +203,14 @@ def _latest_bars(payload: Any) -> dict[str, Any]:
 		if symbol not in latest or str(row.get("timestamp", "")) > str(latest[symbol].get("timestamp", "")):
 			latest[symbol] = row
 	return latest
+
+
+def _latest_prices(payload: Any) -> dict[str, float]:
+	return {
+		symbol: float(row["close"])
+		for symbol, row in _latest_bars(payload).items()
+		if row.get("close") is not None and float(row["close"]) > 0.0
+	}
 
 
 def _evidence_text(payload: Any) -> str:
@@ -235,10 +267,29 @@ def _crew_kickoff(agents: list[Any], tasks: list[Any], inputs: dict[str, Any]) -
 	return crew.kickoff(inputs=inputs)
 
 
-def run_crew(student: str, mode: str) -> dict[str, Any]:
+def _scale_target_weights(
+	weights: Mapping[str, float], target_scale: float, max_total_exposure: float
+) -> dict[str, float]:
+	gross_exposure = sum(float(weight) for weight in weights.values())
+	cap_scale = min(1.0, max_total_exposure / gross_exposure) if gross_exposure > 0.0 else 1.0
+	combined_scale = min(target_scale, cap_scale)
+	return {symbol: float(weight) * combined_scale for symbol, weight in weights.items()}
+
+
+def run_crew(
+	student: str,
+	mode: str,
+	*,
+	target_scale: float = 1.0,
+	max_total_exposure: float = 1.0,
+	allow_reduced_exposure: bool = False,
+	execution_handler: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
 	student = student.upper()
 	if mode not in {"dry", "paper"}:
 		raise ValueError("mode must be dry or paper")
+	if not 0.0 <= target_scale <= 1.0 or not 0.0 < max_total_exposure <= 1.0:
+		raise ValueError("target_scale and max_total_exposure must be within their supported ranges")
 	if mode == "paper" and os.environ.get("TRADING_ENABLED", "").strip().lower() != "true":
 		raise PermissionError("Paper execution requires TRADING_ENABLED=true")
 	config = _read_config(student)
@@ -280,10 +331,18 @@ def run_crew(student: str, mode: str) -> dict[str, Any]:
 		bars = _call_tool(tool_map, "get_ohlcv_batch", symbols=symbols, days=30, student=student)
 		indicators = _call_tool(tool_map, "compute_indicators", symbols=symbols)
 		headlines = _call_tool(tool_map, "news_fetch", symbols=symbols, student=student)
-		blend = _call_tool(tool_map, "blend_scores", student=student, symbols=symbols)
+		blend = (
+			_dry_blend_scores(student, symbols)
+			if mode == "dry"
+			else _call_tool(tool_map, "blend_scores", student=student, symbols=symbols)
+		)
 		if not isinstance(blend, dict) or not isinstance(blend.get("target_weights"), dict):
 			raise RuntimeError("blend_scores did not return MCP target_weights")
-		target_weights = blend["target_weights"]
+		target_weights = _scale_target_weights(
+			blend["target_weights"], target_scale, max_total_exposure
+		)
+		blend["target_weights"] = target_weights
+		blend["gross_exposure"] = round(sum(target_weights.values()), 8)
 		mode_dry = mode == "dry"
 		try:
 			validation = _call_tool(
@@ -292,6 +351,7 @@ def run_crew(student: str, mode: str) -> dict[str, Any]:
 				student=student,
 				target_weights=target_weights,
 				dry_run=mode_dry,
+				allow_reduced_exposure=allow_reduced_exposure,
 			)
 		except Exception as error:
 			validation = {"valid": False, "error": f"{type(error).__name__}: portfolio validation rejected the plan"}
@@ -300,7 +360,10 @@ def run_crew(student: str, mode: str) -> dict[str, Any]:
 		validation_tool = tool_map.get("validate_portfolio")
 		if validation_tool is None:
 			raise RuntimeError("MCP server does not expose required tool validate_portfolio")
-		agents = create_agents(llm, risk_tools=[_create_risk_validation_tool(validation_tool)])
+		agents = create_agents(
+			llm,
+			risk_tools=[_create_risk_validation_tool(validation_tool, allow_reduced_exposure)],
+		)
 		phase_one_tasks = create_phase_one_tasks(agents, run_dir, stamp)
 		scores = blend.get("signal_scores", {})
 		phase_one_inputs = {
@@ -327,11 +390,14 @@ def run_crew(student: str, mode: str) -> dict[str, Any]:
 		}
 		_persist_task_outputs(phase_one_tasks, phase_one_evidence, selection)
 
-		risk_task = create_risk_task(agents["RiskOfficer"], run_dir, stamp, validation_passed)
+		risk_task = create_risk_task(
+			agents["RiskOfficer"], run_dir, stamp, validation_passed, allow_reduced_exposure
+		)
 		risk_input = {
 			"student": student,
 			"target_weights_json": _evidence_text(target_weights),
 			"dry_run": mode_dry,
+			"allow_reduced_exposure": allow_reduced_exposure,
 			"risk_evidence": _evidence_text({"validation": validation, "target_weights": target_weights}),
 		}
 		_crew_kickoff([agents["RiskOfficer"]], [risk_task], risk_input)
@@ -340,7 +406,20 @@ def run_crew(student: str, mode: str) -> dict[str, Any]:
 		_persist_task_outputs([risk_task], {"RiskOfficer": {"validation": validation, "target_weights": target_weights}}, selection)
 
 		execution: dict[str, Any]
-		if not risk_approved:
+		if execution_handler is not None:
+			execution = execution_handler(
+				{
+					"tool_map": tool_map,
+					"student": student,
+					"target_weights": target_weights,
+					"validation": validation,
+					"risk_approved": risk_approved,
+					"mode": mode,
+					"dry_run": mode_dry,
+					"latest_prices": _latest_prices(bars),
+				}
+			)
+		elif not risk_approved:
 			execution = {"approved": False, "submitted": False, "reason": "RiskOfficer rejected or MCP validation failed", "orders": []}
 		else:
 			portfolio_diff = _call_tool(
@@ -398,6 +477,9 @@ def run_crew(student: str, mode: str) -> dict[str, Any]:
 		"risk_approved": risk_approved,
 		"run_dir": str(run_dir),
 		"execution": execution,
+		"validation": validation,
+		"target_weights": target_weights,
+		"latest_prices": _latest_prices(bars),
 	}
 
 

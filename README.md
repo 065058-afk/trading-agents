@@ -27,3 +27,7 @@ Run `python backtest.py --student A` for a five-year walk-forward comparison. Th
 ## Crew Runner
 
 `crew/crew.py` selects Groq, Ollama Cloud, or local Ollama in configured order, connects to `mcp_server/server.py` over stdio, and enforces the validator result before execution. Run `python -m crew.crew --student A --mode dry` for a non-submitting run; use `--mode paper` only with `TRADING_ENABLED=true`.
+
+## Daily Cycle Runner
+
+`run_cycle.py` checks Alpaca's market clock, skips a completed student/date cycle, refreshes data and retrains the ML signal through the crew, then validates and executes sells before buys. It writes peak equity and daily run status to `logs/<student>/state.json`, limits each order to $10,000, total target exposure to 100%, and each cycle to 10 orders. Set `TRADING_ENABLED=true` for `--mode live`; otherwise live requests are forced to dry mode. `--force-clock` bypasses the market clock for dry tests only. Run `python run_cycle.py --student A --mode dry`.

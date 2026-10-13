@@ -94,6 +94,7 @@ def create_risk_task(
 	run_dir: Path,
 	stamp: str,
 	validation_passed: bool,
+	allow_reduced_exposure: bool = False,
 ) -> Task:
 	def risk_guardrail(task_output: Any) -> Tuple[bool, Any]:
 		passed, content = _guardrail(task_output)
@@ -108,7 +109,8 @@ def create_risk_task(
 		"RiskOfficer",
 		agent,
 		"Call the validate_portfolio MCP tool with student={student}, target_weights_json={target_weights_json}, "
-		"and dry_run={dry_run}. Treat its result as authoritative. You MUST reject if the call fails, "
+		"dry_run={dry_run}, and allow_reduced_exposure={allow_reduced_exposure}. Treat its result as authoritative. "
+		"You MUST reject if the call fails, "
 		"valid is false, or any check failed; approve only a validated plan. "
 		"Additional evidence: {risk_evidence}",
 		run_dir / f"RiskOfficer{stamp}.md",

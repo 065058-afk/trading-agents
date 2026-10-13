@@ -71,6 +71,22 @@ def test_blend_is_long_only_capped_and_in_configured_share_range(monkeypatch):
 	assert all(weights[symbol] <= config["max_position_pct_diversified"] for symbol in config["diversified"])
 
 
+def test_dry_blend_retrains_ml_without_persisting_a_model(monkeypatch):
+	monkeypatch.setenv("MCP_DRY_RUN", "1")
+	config = server._config("A")
+	requested = [*config["high_beta"], *config["diversified"]]
+	calls = []
+
+	def fake_signal_ml(symbols, *, history, persist, walk_forward):
+		calls.append((list(symbols), set(history), persist, walk_forward))
+		return {symbol: 0.0 for symbol in symbols}
+
+	monkeypatch.setattr(server.signal_engine, "signal_ml", fake_signal_ml)
+	server.blend_scores("A", requested)
+
+	assert calls == [(requested, set(requested), False, False)]
+
+
 def test_earnings_guard_symbols_get_no_weight():
 	config = server._config("A")
 	symbols = [*config["high_beta"], *config["diversified"]]
@@ -94,6 +110,19 @@ def test_validate_portfolio_rejects_bad_count_and_insufficient_buying_power(monk
 		server.validate_portfolio("A", valid_weights, dry_run=True, required_buying_power=200_000)
 
 
+def test_validate_portfolio_allows_reduced_exposure_only_when_requested():
+	config = server._config("A")
+	symbols = [*config["high_beta"][:5], *config["diversified"][:5]]
+	weights = {symbol: 0.05 for symbol in symbols}
+
+	with pytest.raises(ValueError, match="gross_exposure_90_to_100_percent"):
+		server.validate_portfolio("A", weights, dry_run=True)
+
+	result = server.validate_portfolio("A", weights, dry_run=True, allow_reduced_exposure=True)
+	assert result["valid"] is True
+	assert result["gross_exposure"] == pytest.approx(0.5)
+
+
 def test_validate_portfolio_rejects_low_high_beta_count_and_position_cap(monkeypatch):
 	config = server._config("A")
 	high_beta = config["high_beta"]
@@ -113,11 +142,15 @@ def test_place_orders_dry_run_never_requires_credentials_or_submits(monkeypatch)
 	monkeypatch.delenv("ALPACA_KEY_A", raising=False)
 	monkeypatch.delenv("ALPACA_SECRET_A", raising=False)
 	monkeypatch.delenv("TRADING_ENABLED", raising=False)
-	result = server.place_orders("A", [{"symbol": "AAPL", "side": "buy", "qty": 1}], dry_run=True)
+	result = server.place_orders(
+		"A",
+		[{"symbol": "AAPL", "side": "buy", "qty": 1, "client_order_id": "cycle-A-20261013-buy-AAPL"}],
+		dry_run=True,
+	)
 
 	assert result["submitted"] is False
 	assert result["dry_run"] is True
-	assert result["orders"][0]["client_order_id"].startswith("202")
+	assert result["orders"][0]["client_order_id"] == "cycle-A-20261013-buy-AAPL"
 	second = server.place_orders("A", [{"symbol": "AAPL", "side": "buy", "qty": 1}], dry_run=True)
 	assert second["orders"][0]["client_order_id"] != result["orders"][0]["client_order_id"]
 

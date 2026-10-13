@@ -79,6 +79,28 @@ def test_signals_return_bounded_finite_scores(monkeypatch, tmp_path):
     assert all("ic" in entry and "hit_rate" in entry for entry in fold_entries)
 
 
+def test_dry_ml_retrain_can_skip_walk_forward_evaluation(monkeypatch, tmp_path):
+    frames = _market_frames()
+    symbols = ["AAA", "BBB", "CCC"]
+    monkeypatch.setattr(signals, "MODEL_DIR", tmp_path / "models")
+    monkeypatch.setattr(signals, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(
+        signals,
+        "_walk_forward_folds",
+        lambda panel: (_ for _ in ()).throw(AssertionError("dry retraining ran walk-forward folds")),
+    )
+
+    scores = signals.signal_ml(
+        symbols,
+        history=frames,
+        persist=False,
+        walk_forward=False,
+    )
+
+    _assert_valid_scores(scores, symbols)
+    assert not (tmp_path / "models").exists()
+
+
 def test_price_signals_and_ml_do_not_use_future_bars(monkeypatch, tmp_path):
     original = _market_frames()
     symbols = ["AAA", "BBB", "CCC"]

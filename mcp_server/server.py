@@ -430,6 +430,12 @@ def blend_scores(student: str, symbols: list[str] | None = None) -> dict[str, An
 			}
 			for signal_index, name in enumerate(("trend", "rotation", "breakout", "dip", "ml", "news"))
 		}
+		score_map["ml"] = signal_engine.signal_ml(
+			requested,
+			history=_market_frames(requested, dry_run=True),
+			persist=False,
+			walk_forward=False,
+		)
 		regime = "risk_on"
 		earnings: list[str] = []
 	else:
@@ -454,6 +460,7 @@ def validate_portfolio(
 	target_weights: dict[str, float],
 	dry_run: bool = False,
 	required_buying_power: float | None = None,
+	allow_reduced_exposure: bool = False,
 ) -> dict[str, Any]:
 	config = _config(student)
 	weights = _coerce_weights(target_weights)
@@ -468,7 +475,11 @@ def validate_portfolio(
 		for symbol, weight in weights.items()
 	)
 	gross = sum(weights.values())
-	checks["gross_exposure_90_to_100_percent"] = 0.90 <= gross <= 1.000001
+	checks["gross_exposure_90_to_100_percent"] = (
+		0.0 <= gross <= 1.000001
+		if allow_reduced_exposure
+		else 0.90 <= gross <= 1.000001
+	)
 	if not all(checks.values()):
 		failed = [name for name, passed in checks.items() if not passed]
 		raise ValueError(f"Portfolio validation failed: {', '.join(failed)}")
@@ -684,13 +695,21 @@ def place_orders(
 	dry_run: bool = True,
 ) -> dict[str, Any]:
 	normalized = []
+	seen_client_order_ids: set[str] = set()
 	for order in orders:
 		symbol = str(order.get("symbol", "")).strip().upper()
 		side = str(order.get("side", "")).strip().lower()
 		qty = float(order.get("qty", 0.0))
 		if not _SYMBOL_RE.fullmatch(symbol) or side not in {"buy", "sell"} or not math.isfinite(qty) or qty <= 0:
 			raise ValueError("each order must have a valid symbol, buy/sell side, and positive quantity")
-		client_order_id = f"{date.today():%Y%m%d}-{symbol}-{side}-{uuid.uuid4().hex[:8]}"
+		client_order_id = str(
+			order.get("client_order_id") or f"{date.today():%Y%m%d}-{symbol}-{side}-{uuid.uuid4().hex[:8]}"
+		)
+		if not re.fullmatch(r"[A-Za-z0-9_-]{1,48}", client_order_id):
+			raise ValueError("client_order_id must be 1-48 alphanumeric, underscore, or hyphen characters")
+		if client_order_id in seen_client_order_ids:
+			raise ValueError("client_order_id values must be unique within an order batch")
+		seen_client_order_ids.add(client_order_id)
 		normalized.append({"symbol": symbol, "side": side, "qty": qty, "client_order_id": client_order_id})
 	if _dry_run(dry_run):
 		return {"submitted": False, "dry_run": True, "orders": normalized}

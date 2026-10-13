@@ -3,12 +3,16 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from crew.agents import AgentReport, create_agents
 from crew.crew import (
 	ProviderSelection,
 	_create_llm,
+	_dry_blend_scores,
 	_create_risk_validation_tool,
 	_read_config,
+	_scale_target_weights,
 	select_provider,
 )
 from crew.tasks import create_phase_one_tasks, create_phase_three_tasks, create_risk_task
@@ -73,7 +77,7 @@ def test_student_configs_prefer_installed_local_free_model():
 	for student in ("A", "B", "C"):
 		llm_config = _read_config(student)["llm"]
 		assert llm_config["provider_order"][0] == "ollama_local"
-		assert llm_config["providers"]["ollama_local"]["model"] == "llama3.2:3b"
+		assert llm_config["providers"]["ollama_local"]["model"] == "qwen3:0.6b"
 		assert llm_config["max_tokens"] == 1024
 
 
@@ -109,6 +113,31 @@ def test_llm_caps_completion_tokens():
 	llm = _create_llm(selection, 0.1, 30, max_tokens=256)
 
 	assert llm.max_tokens == 256
+
+
+def test_target_weight_scaling_enforces_total_exposure_cap():
+	weights = _scale_target_weights({"AAA": 0.7, "BBB": 0.5}, 1.0, 0.9)
+	breaker_weights = _scale_target_weights(weights, 0.5, 0.9)
+
+	assert sum(weights.values()) == pytest.approx(0.9)
+	assert sum(breaker_weights.values()) == pytest.approx(0.45)
+
+
+def test_dry_blend_uses_local_mcp_logic_with_dry_flag(monkeypatch):
+	calls = []
+
+	def fake_blend_scores(student, symbols):
+		calls.append((student, symbols, __import__("os").environ.get("MCP_DRY_RUN")))
+		return {"target_weights": {"AAA": 1.0}}
+
+	monkeypatch.setattr("mcp_server.server.blend_scores", fake_blend_scores)
+	monkeypatch.delenv("MCP_DRY_RUN", raising=False)
+
+	result = _dry_blend_scores("A", ["AAA"])
+
+	assert result == {"target_weights": {"AAA": 1.0}}
+	assert calls == [("A", ["AAA"], "1")]
+	assert "MCP_DRY_RUN" not in __import__("os").environ
 
 
 def test_phase_layout_parallelizes_signal_tasks_and_names_agent_files(tmp_path):
@@ -172,4 +201,11 @@ def test_risk_validation_tool_uses_groq_compatible_schema_and_calls_mcp():
 		dry_run=True,
 	)
 	assert json.loads(result) == {"valid": True}
-	assert calls == [{"student": "A", "target_weights": {"AAPL": 1.0}, "dry_run": True}]
+	assert calls == [
+		{
+			"student": "A",
+			"target_weights": {"AAPL": 1.0},
+			"dry_run": True,
+			"allow_reduced_exposure": False,
+		}
+	]
