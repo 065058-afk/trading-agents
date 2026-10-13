@@ -247,6 +247,8 @@ def _create_llm(
 			max_tokens=max_tokens,
 			**options,
 		)
+	if selection.name == "ollama_local" and selection.model.lower().startswith("qwen3"):
+		options["additional_params"] = {"extra_body": {"think": False}}
 	return LLM(
 		model=f"ollama_chat/{selection.model}",
 		base_url=selection.base_url,

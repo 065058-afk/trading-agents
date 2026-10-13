@@ -156,6 +156,14 @@ def test_ollama_cloud_adds_openai_compatible_api_path():
 	assert str(llm.base_url) == "https://ollama.com/v1"
 
 
+def test_local_qwen3_disables_thinking_to_avoid_json_truncation():
+	selection = ProviderSelection("ollama_local", "qwen3:0.6b", "http://localhost:11434", None)
+
+	llm = _create_llm(selection, 0.1, 30)
+
+	assert llm.additional_params["extra_body"]["think"] is False
+
+
 def test_llm_caps_completion_tokens():
 	selection = ProviderSelection("groq", "openai/gpt-oss-20b", "https://api.groq.test/v1", "test-only")
 	llm = _create_llm(selection, 0.1, 30, max_tokens=256)
