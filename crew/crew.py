@@ -367,6 +367,12 @@ def _call_agent_report(
 				if attempt == 0 and attempts == 2 and status in {400, 429}:
 					if status == 429:
 						limiter.wait_for_retry_after(_retry_after_seconds(error) or 1.0)
+					try:
+						plain_text = llm.call(prompt)
+						parsed = _parse_agent_report(plain_text)
+						return parsed, None, candidate.name
+					except Exception:
+						pass
 					continue
 				break
 	return None, last_reason, None

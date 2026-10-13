@@ -277,6 +277,25 @@ def test_groq_400_retries_then_falls_back_to_ollama_cloud(monkeypatch):
 	assert [model.calls for model in models.values()] == [2, 1, 1]
 
 
+def test_groq_schema_failures_retry_without_strict_response_model(monkeypatch):
+	monkeypatch.setenv("GROQ_MODEL_FALLBACK", "openai/gpt-oss-120b")
+	selection = ProviderSelection("groq", "openai/gpt-oss-20b", "https://api.groq.test/v1", "groq-test-key")
+	provider_model = FakeLLM([MockHTTPError(400), '{"status":"complete","decision":"approve","summary":"Recovered via plain text","observations":[],"blockers":[]}'])
+	monkeypatch.setattr(
+		"crew.crew._create_llm",
+		lambda candidate, *args: provider_model,
+	)
+
+	report, unavailable, provider = _call_agent_report(
+		selection, _fallback_settings(), "short prompt", FakeLimiter(), {}
+	)
+
+	assert report["summary"] == "Recovered via plain text"
+	assert unavailable is None
+	assert provider == "groq"
+	assert provider_model.calls == 2
+
+
 def test_retry_after_reads_numeric_header_and_short_error_hides_key():
 	error = MockHTTPError(429, 4, "request failed with groq-secret")
 
