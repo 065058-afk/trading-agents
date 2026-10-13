@@ -42,7 +42,7 @@ def _make_task(
 		async_execution=async_execution,
 		output_pydantic=AgentReport,
 		guardrail=guardrail,
-		guardrail_max_retries=1,
+		guardrail_max_retries=0,
 		output_file=str(output_file),
 		create_directory=True,
 	)
@@ -51,42 +51,20 @@ def _make_task(
 def create_phase_one_tasks(
 	agents: dict[str, Agent], run_dir: Path, stamp: str
 ) -> list[Task]:
-	tasks = [
+	return [
 		_make_task(
-			"Data",
-			agents["Data"],
-			"Summarize MCP market data coverage and any warnings. Use only this JSON evidence: {data_evidence}",
-			run_dir / f"Data{stamp}.md",
-		)
-	]
-	for agent_name, key in (
-		("Trend", "trend"),
-		("Rotation", "rotation"),
-		("Breakout", "breakout"),
-		("Dip", "dip"),
-		("ML", "ml"),
-		("News", "news"),
-	):
-		tasks.append(
-			_make_task(
-				agent_name,
-				agents[agent_name],
-				f"Review only the MCP-produced {key} evidence. Do not calculate scores or invent figures. "
-				f"Evidence: {{{key}_evidence}}",
-				run_dir / f"{agent_name}{stamp}.md",
-				async_execution=True,
-			)
-		)
-	tasks.append(
+			"News",
+			agents["News"],
+			"Summarize supplied headlines and news scores; flag event risk. Evidence: {news_evidence}",
+			run_dir / f"News{stamp}.md",
+		),
 		_make_task(
 			"PortfolioManager",
 			agents["PortfolioManager"],
-			"Summarize the MCP-generated target weights and regime. Do not change the plan or introduce new numbers. "
-			"Evidence: {portfolio_evidence}",
+			"Summarize the final MCP target allocation and regime. Do not change the plan. Evidence: {portfolio_evidence}",
 			run_dir / f"PortfolioManager{stamp}.md",
-		)
-	)
-	return tasks
+		),
+	]
 
 
 def create_risk_task(
@@ -108,11 +86,8 @@ def create_risk_task(
 	return _make_task(
 		"RiskOfficer",
 		agent,
-		"Call the validate_portfolio MCP tool with student={student}, target_weights_json={target_weights_json}, "
-		"dry_run={dry_run}, and allow_reduced_exposure={allow_reduced_exposure}. Treat its result as authoritative. "
-		"You MUST reject if the call fails, "
-		"valid is false, or any check failed; approve only a validated plan. "
-		"Additional evidence: {risk_evidence}",
+		"Review the precomputed MCP validation in {risk_evidence}. Reject if it is invalid or any check failed; "
+		"otherwise approve. Do not call tools or alter targets.",
 		run_dir / f"RiskOfficer{stamp}.md",
 		guardrail=risk_guardrail,
 	)

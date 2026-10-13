@@ -26,7 +26,7 @@ Run `python backtest.py --student A` for a five-year walk-forward comparison. Th
 
 ## Crew Runner
 
-`crew/crew.py` selects Groq, Ollama Cloud, or local Ollama in configured order, connects to `mcp_server/server.py` over stdio, and enforces the validator result before execution. Run `python -m crew.crew --student A --mode dry` for a non-submitting run; use `--mode paper` only with `TRADING_ENABLED=true`.
+`crew/crew.py` connects to `mcp_server/server.py` over stdio and uses MCP outputs as the numeric authority. Data and signal Markdown reports are written directly from tool results; only News, PortfolioManager, RiskOfficer, Execution, and Reporter use structured LLM commentary, sequentially, with compact evidence and a 160-token output cap. Groq calls are limited to 8,000 estimated tokens per minute, retry once on HTTP 400/429 (respecting `Retry-After` for 429), then fall back to `GROQ_MODEL_FALLBACK` and Ollama Cloud. Set `GROQ_MODEL` to select the primary Groq model. If commentary is unavailable, deterministic MCP validation and orders remain in force, with news scores set to zero. Run `python -m crew.crew --student A --mode dry` for a non-submitting run; use `--mode paper` only with `TRADING_ENABLED=true`.
 
 ## Daily Cycle Runner
 
