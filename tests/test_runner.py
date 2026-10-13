@@ -8,9 +8,15 @@ import run_cycle
 
 
 class FakeClient:
-	def __init__(self, *, is_open: bool = True, equity: float = 100_000.0):
+	def __init__(self, *, is_open: bool = True, equity: float = 100_000.0, positions=None):
 		self.clock = SimpleNamespace(is_open=is_open)
-		self.account = SimpleNamespace(equity=equity)
+		self.account = SimpleNamespace(
+			equity=equity,
+			portfolio_value=equity,
+			buying_power=equity,
+			cash=equity,
+		)
+		self.positions = positions or []
 		self.account_calls = 0
 		self.clock_calls = 0
 
@@ -22,13 +28,17 @@ class FakeClient:
 		self.account_calls += 1
 		return self.account
 
+	def get_all_positions(self):
+		return self.positions
+
 
 class FakeTool:
-	def __init__(self, name, calls, *, exit_orders=None, diff_orders=None):
+	def __init__(self, name, calls, *, exit_orders=None, diff_orders=None, positions=None):
 		self.name = name
 		self.calls = calls
 		self.exit_orders = exit_orders or []
 		self.diff_orders = diff_orders or []
+		self.positions = positions or []
 
 	def run(self, **arguments):
 		self.calls.append((self.name, arguments))
@@ -42,23 +52,38 @@ class FakeTool:
 				"dry_run": arguments["dry_run"],
 				"orders": arguments["orders"],
 			}
+		if self.name == "get_account":
+			return {"account": {"equity": 100_000.0}, "positions": self.positions, "dry_run": arguments["dry_run"]}
 		raise AssertionError(f"unexpected tool {self.name}")
 
 
-def install_cycle_fakes(monkeypatch, tmp_path, *, is_open=True, equity=100_000.0, diff_orders=None):
-	client = FakeClient(is_open=is_open, equity=equity)
+def install_cycle_fakes(
+	monkeypatch,
+	tmp_path,
+	*,
+	is_open=True,
+	equity=100_000.0,
+	diff_orders=None,
+	exit_orders=None,
+	positions=None,
+	current_positions=None,
+):
+	client = FakeClient(is_open=is_open, equity=equity, positions=current_positions)
 	calls = []
+	if positions is None:
+		positions = [{"symbol": "MSFT", "qty": 5.0, "qty_available": 5.0, "side": "long"}]
 	tools = {
 		"check_exits": FakeTool(
 			"check_exits",
 			calls,
-			exit_orders=[{"symbol": "MSFT", "side": "sell", "qty": 1.0}],
+			exit_orders=exit_orders or [{"symbol": "MSFT", "side": "sell", "qty": 1.0}],
 		),
 		"portfolio_diff": FakeTool("portfolio_diff", calls, diff_orders=diff_orders or [
 			{"symbol": "AAPL", "side": "buy", "qty": 200.0},
 			{"symbol": "MSFT", "side": "sell", "qty": 2.0},
 		]),
 		"place_orders": FakeTool("place_orders", calls),
+		"get_account": FakeTool("get_account", calls, positions=positions),
 	}
 	crew_calls = []
 
@@ -143,7 +168,22 @@ def test_trading_enabled_false_forces_live_request_to_dry(monkeypatch, tmp_path)
 
 
 def test_completed_run_for_date_is_skipped(monkeypatch, tmp_path):
-	client, _, crew_calls = install_cycle_fakes(monkeypatch, tmp_path)
+	client, _, crew_calls = install_cycle_fakes(
+		monkeypatch,
+		tmp_path,
+		current_positions=[
+			SimpleNamespace(
+				symbol="AAPL",
+				qty="4",
+				qty_available="3",
+				side="long",
+				avg_entry_price="100",
+				market_value="440",
+				current_price="110",
+			)
+		],
+	)
+	events = []
 	state_path = tmp_path / "logs" / "A" / "state.json"
 	state_path.parent.mkdir(parents=True)
 	state_path.write_text(
@@ -151,11 +191,24 @@ def test_completed_run_for_date_is_skipped(monkeypatch, tmp_path):
 		encoding="utf-8",
 	)
 
-	result = run_cycle.run_cycle("A", "dry")
+	result = run_cycle.run_cycle("A", "dry", event_callback=lambda event, payload: events.append((event, payload)))
 
 	assert result == 0
-	assert client.account_calls == 0
+	assert client.account_calls == 1
 	assert crew_calls == []
+	skip_payload = next(payload for event, payload in events if event == "cycle_skipped")
+	assert skip_payload["account_snapshot"]["account"]["equity"] == 100_000.0
+	assert skip_payload["account_snapshot"]["positions"] == [
+		{
+			"symbol": "AAPL",
+			"qty": 4.0,
+			"qty_available": 3.0,
+			"side": "long",
+			"avg_entry_price": 100.0,
+			"market_value": 440.0,
+			"current_price": 110.0,
+		}
+	]
 
 
 def test_drawdown_breaker_halves_targets_and_blocks_buys(monkeypatch, tmp_path):
@@ -182,7 +235,7 @@ def test_order_caps_and_sell_first_submission(monkeypatch, tmp_path):
 	monkeypatch.setenv("TRADING_ENABLED", "true")
 	many_buys = [
 		{"symbol": f"SYM{index}", "side": "buy", "qty": 500.0}
-		for index in range(12)
+		for index in range(25)
 	]
 	client = FakeClient()
 	calls = []
@@ -192,6 +245,11 @@ def test_order_caps_and_sell_first_submission(monkeypatch, tmp_path):
 		),
 		"portfolio_diff": FakeTool("portfolio_diff", calls, diff_orders=many_buys),
 		"place_orders": FakeTool("place_orders", calls),
+		"get_account": FakeTool(
+			"get_account",
+			calls,
+			positions=[{"symbol": "MSFT", "qty": 500.0, "qty_available": 500.0, "side": "long"}],
+		),
 	}
 
 	def run_with_large_diff(student, mode, **kwargs):
@@ -200,7 +258,7 @@ def test_order_caps_and_sell_first_submission(monkeypatch, tmp_path):
 			"target_weights": {},
 			"validation": {"valid": True},
 			"risk_approved": True,
-			"latest_prices": {**{f"SYM{index}": 50.0 for index in range(12)}, "MSFT": 50.0},
+			"latest_prices": {**{f"SYM{index}": 50.0 for index in range(25)}, "MSFT": 50.0},
 		}
 		return {"execution": kwargs["execution_handler"](context)}
 
@@ -215,9 +273,41 @@ def test_order_caps_and_sell_first_submission(monkeypatch, tmp_path):
 	placements = [(name, args) for name, args in calls if name == "place_orders"]
 	assert len(placements) == 2
 	assert all(order["side"] == "sell" for order in placements[0][1]["orders"])
-	assert len(placements[1][1]["orders"]) == 9
+	assert len(placements[1][1]["orders"]) == 19
 	assert all(order["side"] == "buy" for order in placements[1][1]["orders"])
 	all_orders = [order for _, arguments in placements for order in arguments["orders"]]
-	assert len(all_orders) == run_cycle.MAX_ORDERS_PER_DAY
+	assert len(all_orders) == 20
 	assert all(order["qty"] * 50.0 <= run_cycle.MAX_ORDER_NOTIONAL_USD for order in all_orders)
 	assert len({order["client_order_id"] for order in all_orders}) == len(all_orders)
+	state = json.loads((tmp_path / "logs" / "A" / "state.json").read_text(encoding="utf-8"))
+	assert state["runs"]["2026-10-13"]["daily_order_cap"]["limit"] == 20
+
+
+def test_execution_nets_symbols_and_caps_sells_to_available_long_quantity(monkeypatch, tmp_path):
+	monkeypatch.setenv("TRADING_ENABLED", "true")
+	_, calls, _ = install_cycle_fakes(
+		monkeypatch,
+		tmp_path,
+		diff_orders=[
+			{"symbol": "MSFT", "side": "buy", "qty": 5.0},
+			{"symbol": "MSFT", "side": "sell", "qty": 9.0},
+		],
+		exit_orders=[{"symbol": "MSFT", "side": "sell", "qty": 3.0}],
+		positions=[{"symbol": "MSFT", "qty": 4.0, "qty_available": 2.0, "side": "long"}],
+	)
+
+	assert run_cycle.run_cycle("A", "live") == 0
+	orders = [
+		order
+		for name, arguments in calls
+		if name == "place_orders"
+		for order in arguments["orders"]
+	]
+	assert orders == [{"symbol": "MSFT", "side": "sell", "qty": 2.0, "client_order_id": "cycle-A-20261013-sell-MSFT"}]
+
+
+def test_daily_order_cap_returns_normal_limit_at_half_target(monkeypatch):
+	targets = {"A", "B", "C", "D", "E", "F", "G", "H", "I", "J"}
+	positions = [{"symbol": symbol, "qty": 1.0, "side": "long"} for symbol in "ABCDE"]
+
+	assert run_cycle._daily_order_cap(targets, positions) == (10, "normal", 5)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -49,6 +50,15 @@ def _config(student: str) -> dict[str, Any]:
 	student = student.strip().upper()
 	if student not in STUDENT_CHOICES:
 		raise ValueError("student must be A, B, or C")
+	override_json = os.environ.get("MCP_STUDENT_CONFIG_JSON")
+	if override_json:
+		try:
+			overrides = json.loads(override_json)
+		except json.JSONDecodeError as error:
+			raise ValueError("Invalid in-memory student config override") from error
+		result = overrides.get(student) if isinstance(overrides, Mapping) else None
+		if isinstance(result, dict):
+			return result
 	path = CONFIG_DIR / f"student_{student}.yaml"
 	with path.open(encoding="utf-8") as config_file:
 		result = yaml.safe_load(config_file)
@@ -183,8 +193,9 @@ def _blend_from_scores(
 	score_map: Mapping[str, Mapping[str, float]],
 	regime: str,
 	earnings: Sequence[str],
+	config_override: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-	config = _config(student)
+	config = dict(config_override) if config_override is not None else _config(student)
 	high_beta = [str(symbol).upper() for symbol in config["high_beta"]]
 	diversified = [str(symbol).upper() for symbol in config["diversified"]]
 	requested = list(dict.fromkeys([*high_beta, *diversified])) if not symbols else _normalize_symbols(symbols)
@@ -276,7 +287,11 @@ def _account_snapshot(student: str) -> tuple[dict[str, Any], list[dict[str, Any]
 			"avg_entry_price": _json_number(_field(position, "avg_entry_price")) or 0.0,
 			"market_value": _json_number(_field(position, "market_value")) or 0.0,
 			"current_price": _json_number(_field(position, "current_price")) or 0.0,
-			"qty_available": _json_number(_field(position, "qty_available")) or _json_number(_field(position, "qty")) or 0.0,
+			"qty_available": (
+				_json_number(_field(position, "qty_available"))
+				if _field(position, "qty_available") is not None
+				else _json_number(_field(position, "qty")) or 0.0
+			),
 		}
 		for position in positions
 	]
@@ -301,6 +316,8 @@ def _demo_account(student: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
 
 def _positions_for(student: str, dry_run: bool) -> tuple[dict[str, Any], list[dict[str, Any]]]:
 	if _dry_run(dry_run):
+		if os.environ.get(f"ALPACA_KEY_{student}") and os.environ.get(f"ALPACA_SECRET_{student}"):
+			return _account_snapshot(student)
 		return _demo_account(student)
 	return _account_snapshot(student)
 
@@ -418,10 +435,15 @@ def news_fetch(symbols: list[str], student: str) -> dict[str, list[str]]:
 
 
 @mcp.tool(description="Blend the student's configured signals, regime weights, earnings guard, and position caps.")
-def blend_scores(student: str, symbols: list[str] | None = None) -> dict[str, Any]:
-	config = _config(student)
+def blend_scores(
+	student: str,
+	symbols: list[str] | None = None,
+	dry_run: bool | None = None,
+	config_override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+	config = dict(config_override) if config_override is not None else _config(student)
 	requested = list(dict.fromkeys([*config["high_beta"], *config["diversified"]])) if symbols is None else _normalize_symbols(symbols)
-	is_dry = _dry_run()
+	is_dry = _dry_run() if dry_run is None else dry_run
 	if is_dry:
 		score_map = {
 			name: {
@@ -451,7 +473,7 @@ def blend_scores(student: str, symbols: list[str] | None = None) -> dict[str, An
 		earnings = signal_engine.earnings_guard(
 			requested, int(config["risk"].get("earnings_guard_days", 2))
 		)
-	return _blend_from_scores(student, requested, score_map, regime, earnings)
+	return _blend_from_scores(student, requested, score_map, regime, earnings, config)
 
 
 @mcp.tool(description="Validate basket size, high-beta count, position caps, long-only gross exposure, and account buying power.")
@@ -522,7 +544,7 @@ def portfolio_diff(
 			symbol: float(rows.sort_values("timestamp").iloc[-1]["close"])
 			for symbol, rows in table.groupby("symbol")
 		}
-	current_qty = {position["symbol"]: float(position["qty"]) for position in positions}
+	current_positions = {position["symbol"]: position for position in positions}
 	portfolio_value = float(account["portfolio_value"])
 	diffs = []
 	for symbol, weight in weights.items():
@@ -530,9 +552,20 @@ def portfolio_diff(
 		if not price or price <= 0:
 			continue
 		target_qty = weight * portfolio_value / price
-		delta = target_qty - current_qty.get(symbol, 0.0)
-		if abs(delta) > 1e-6:
-			diffs.append({"symbol": symbol, "side": "buy" if delta > 0 else "sell", "qty": round(abs(delta), 6)})
+		position = current_positions.get(symbol, {})
+		quantity = float(position.get("qty", 0.0))
+		is_short = str(position.get("side", "long")).lower() == "short" or quantity < 0.0
+		current_qty = -abs(quantity) if is_short else max(0.0, quantity)
+		delta = target_qty - current_qty
+		if delta > 1e-6:
+			diffs.append({"symbol": symbol, "side": "buy", "qty": round(delta, 6)})
+		elif delta < -1e-6 and not is_short:
+			held_qty = max(0.0, quantity)
+			available_raw = position.get("qty_available")
+			available_qty = held_qty if available_raw is None else max(0.0, float(available_raw))
+			sell_qty = min(-delta, held_qty, available_qty)
+			if sell_qty > 1e-6:
+				diffs.append({"symbol": symbol, "side": "sell", "qty": round(sell_qty, 6)})
 	return {"orders": diffs, "count": len(diffs), "dry_run": is_dry}
 
 
@@ -615,46 +648,55 @@ def check_exits(
 			if position.get("opened_at")
 		}
 		partial_sales: set[str] = set()
-	elif is_dry:
-		current_positions, frames = _mock_positions_for_exits(student)
-		symbols = [position["symbol"] for position in current_positions]
-		entry_dates = {symbol: pd.Timestamp(position["opened_at"]) for symbol, position in zip(symbols, current_positions)}
-		partial_sales = set()
 	else:
-		client = _account_client(student)
-		raw_positions: Any = client.get_all_positions()
-		if isinstance(raw_positions, Mapping):
-			raw_positions = raw_positions.get("positions", [])
+		client: Any | None = None
+		if is_dry:
+			_, positions_snapshot = _positions_for(student, dry_run=True)
+		else:
+			client = _account_client(student)
+			raw_positions: Any = client.get_all_positions()
+			if isinstance(raw_positions, Mapping):
+				raw_positions = raw_positions.get("positions", [])
+			positions_snapshot = [
+				{
+					"symbol": str(_field(position, "symbol", "")).upper(),
+					"qty": float(_field(position, "qty", 0.0)),
+					"qty_available": float(_field(position, "qty_available", None)) if _field(position, "qty_available", None) is not None else None,
+					"avg_entry_price": float(_field(position, "avg_entry_price", 0.0)),
+					"market_value": float(_field(position, "market_value", 0.0) or 0.0),
+					"current_price": float(_field(position, "current_price", 0.0) or 0.0),
+					"side": str(_field(position, "side", "long")),
+				}
+				for position in raw_positions
+			]
 		current_positions = [
-			{
-				"symbol": str(_field(position, "symbol", "")).upper(),
-				"qty": float(_field(position, "qty", 0.0)),
-				"qty_available": float(_field(position, "qty_available", None) or _field(position, "qty", 0.0)),
-				"avg_entry_price": float(_field(position, "avg_entry_price", 0.0)),
-				"market_value": float(_field(position, "market_value", 0.0) or 0.0),
-				"current_price": float(_field(position, "current_price", 0.0) or 0.0),
-				"opened_at": None,
-			}
-			for position in raw_positions
+			{**position, "opened_at": None}
+			for position in positions_snapshot
 		]
 		if not current_positions:
-			return {"orders": [], "count": 0, "dry_run": False}
+			return {"orders": [], "count": 0, "dry_run": is_dry}
 		symbols = [position["symbol"] for position in current_positions]
-		bars = market_data.get_ohlcv_batch(symbols, 90, student=student)
-		frames = {
-			symbol: rows.sort_values("timestamp").set_index("timestamp").loc[:, list(OHLCV_COLUMNS)]
-			for symbol, rows in bars.groupby("symbol")
-		}
-		from alpaca.trading.enums import QueryOrderStatus
-		from alpaca.trading.requests import GetOrdersRequest
+		if is_dry:
+			frames = _market_frames(symbols, dry_run=True)
+			entry_dates = {}
+			partial_sales = set()
+		else:
+			assert client is not None
+			bars = market_data.get_ohlcv_batch(symbols, 90, student=student)
+			frames = {
+				symbol: rows.sort_values("timestamp").set_index("timestamp").loc[:, list(OHLCV_COLUMNS)]
+				for symbol, rows in bars.groupby("symbol")
+			}
+			from alpaca.trading.enums import QueryOrderStatus
+			from alpaca.trading.requests import GetOrdersRequest
 
-		orders_history = client.get_orders(
-			GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=500, symbols=symbols)
-		)
-		if isinstance(orders_history, Mapping):
-			orders_history = orders_history.get("orders", [])
-		orders_history = list(orders_history)
-		entry_dates, partial_sales = _entry_dates_and_partial_sells(orders_history, symbols)
+			orders_history = client.get_orders(
+				GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=500, symbols=symbols)
+			)
+			if isinstance(orders_history, Mapping):
+				orders_history = orders_history.get("orders", [])
+			orders_history = list(orders_history)
+			entry_dates, partial_sales = _entry_dates_and_partial_sells(orders_history, symbols)
 	orders: list[dict[str, Any]] = []
 	risk = config.get("risk", {})
 	for position in current_positions:
@@ -674,7 +716,14 @@ def check_exits(
 		observed = frame if entry_date is None else frame.loc[frame.index >= entry_date.tz_localize(None) if entry_date.tzinfo else entry_date]
 		high_water = float(observed["high"].max()) if not observed.empty else current_price
 		stop_price = high_water - float(risk.get("atr_trailing_stop", 2.5)) * atr_value
-		qty = min(float(position.get("qty_available") or position["qty"]), float(position["qty"]))
+		position_qty = float(position["qty"])
+		if str(position.get("side", "long")).lower() == "short" or position_qty <= 0.0:
+			continue
+		available_raw = position.get("qty_available")
+		available_qty = position_qty if available_raw is None else max(0.0, float(available_raw))
+		qty = min(available_qty, position_qty)
+		if qty <= 0.0:
+			continue
 		if current_price <= stop_price:
 			orders.append({"symbol": symbol, "side": "sell", "qty": qty, "reason": "atr_trailing_stop"})
 			continue

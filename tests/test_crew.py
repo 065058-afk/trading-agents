@@ -126,8 +126,8 @@ def test_target_weight_scaling_enforces_total_exposure_cap():
 def test_dry_blend_uses_local_mcp_logic_with_dry_flag(monkeypatch):
 	calls = []
 
-	def fake_blend_scores(student, symbols):
-		calls.append((student, symbols, __import__("os").environ.get("MCP_DRY_RUN")))
+	def fake_blend_scores(student, symbols, *, dry_run, config_override):
+		calls.append((student, symbols, dry_run, config_override))
 		return {"target_weights": {"AAA": 1.0}}
 
 	monkeypatch.setattr("mcp_server.server.blend_scores", fake_blend_scores)
@@ -136,8 +136,7 @@ def test_dry_blend_uses_local_mcp_logic_with_dry_flag(monkeypatch):
 	result = _dry_blend_scores("A", ["AAA"])
 
 	assert result == {"target_weights": {"AAA": 1.0}}
-	assert calls == [("A", ["AAA"], "1")]
-	assert "MCP_DRY_RUN" not in __import__("os").environ
+	assert calls == [("A", ["AAA"], True, None)]
 
 
 def test_phase_layout_parallelizes_signal_tasks_and_names_agent_files(tmp_path):

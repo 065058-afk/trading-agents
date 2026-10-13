@@ -154,18 +154,18 @@ def _call_tool(tool_map: Mapping[str, Any], name: str, **arguments: Any) -> Any:
 	return _decode_tool_result(tool.run(**arguments))
 
 
-def _dry_blend_scores(student: str, symbols: list[str]) -> dict[str, Any]:
-	previous_dry_run = os.environ.get("MCP_DRY_RUN")
-	os.environ["MCP_DRY_RUN"] = "1"
-	try:
-		from mcp_server.server import blend_scores
 
-		return blend_scores(student, symbols)
-	finally:
-		if previous_dry_run is None:
-			os.environ.pop("MCP_DRY_RUN", None)
-		else:
-			os.environ["MCP_DRY_RUN"] = previous_dry_run
+def _dry_blend_scores(
+	student: str, symbols: list[str], config_override: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+	from mcp_server.server import blend_scores
+
+	return blend_scores(
+		student,
+		symbols,
+		dry_run=True,
+		config_override=dict(config_override) if config_override is not None else None,
+	)
 
 
 def _create_risk_validation_tool(mcp_tool: Any, breaker_allows_reduced_exposure: bool = False) -> Any:
@@ -284,6 +284,9 @@ def run_crew(
 	max_total_exposure: float = 1.0,
 	allow_reduced_exposure: bool = False,
 	execution_handler: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+	config_override: Mapping[str, Any] | None = None,
+	credential_override: Mapping[str, str] | None = None,
+	cycle_event_callback: Callable[[str, Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
 	student = student.upper()
 	if mode not in {"dry", "paper"}:
@@ -292,7 +295,7 @@ def run_crew(
 		raise ValueError("target_scale and max_total_exposure must be within their supported ranges")
 	if mode == "paper" and os.environ.get("TRADING_ENABLED", "").strip().lower() != "true":
 		raise PermissionError("Paper execution requires TRADING_ENABLED=true")
-	config = _read_config(student)
+	config = dict(config_override) if config_override is not None else _read_config(student)
 	symbols = list(dict.fromkeys([*config["high_beta"], *config["diversified"]]))
 	now = datetime.now()
 	run_dir = LOG_ROOT / student / now.strftime("%Y%m%d_%H%M%S")
@@ -314,6 +317,13 @@ def run_crew(
 	print(f"LLM provider: {selection.name} ({selection.model})")
 
 	server_env = os.environ.copy()
+	if config_override is not None:
+		server_env["MCP_STUDENT_CONFIG_JSON"] = json.dumps({student: config})
+	if credential_override is not None:
+		for credential_name in (f"ALPACA_KEY_{student}", f"ALPACA_SECRET_{student}"):
+			credential_value = credential_override.get(credential_name)
+			if credential_value:
+				server_env[credential_name] = credential_value
 	if mode == "dry":
 		server_env["MCP_DRY_RUN"] = "1"
 	else:
@@ -326,13 +336,16 @@ def run_crew(
 	)
 	with MCPServerAdapter(server_params) as tool_collection:
 		tool_map = {tool.name: tool for tool in tool_collection}
+		if cycle_event_callback is not None:
+			cycle_event_callback("stage", {"name": "Refreshing market data"})
 		# The MCP tools are the only source for numeric strategy and account values.
 		refresh = _call_tool(tool_map, "refresh_history", symbols=symbols)
-		bars = _call_tool(tool_map, "get_ohlcv_batch", symbols=symbols, days=30, student=student)
+		market_symbols = list(dict.fromkeys([*symbols, "SPY"]))
+		bars = _call_tool(tool_map, "get_ohlcv_batch", symbols=market_symbols, days=30, student=student)
 		indicators = _call_tool(tool_map, "compute_indicators", symbols=symbols)
 		headlines = _call_tool(tool_map, "news_fetch", symbols=symbols, student=student)
 		blend = (
-			_dry_blend_scores(student, symbols)
+			_dry_blend_scores(student, symbols, config_override)
 			if mode == "dry"
 			else _call_tool(tool_map, "blend_scores", student=student, symbols=symbols)
 		)
@@ -377,6 +390,8 @@ def run_crew(
 			"portfolio_evidence": _evidence_text(blend),
 		}
 		phase_one_agents = [agents[name] for name in ("Data", "Trend", "Rotation", "Breakout", "Dip", "ML", "News", "PortfolioManager")]
+		if cycle_event_callback is not None:
+			cycle_event_callback("stage", {"name": "Analyzing signals and news"})
 		_crew_kickoff(phase_one_agents, phase_one_tasks, phase_one_inputs)
 		phase_one_evidence = {
 			"Data": {"refresh": refresh, "latest_bars": _latest_bars(bars), "indicators": indicators},
@@ -393,6 +408,8 @@ def run_crew(
 		risk_task = create_risk_task(
 			agents["RiskOfficer"], run_dir, stamp, validation_passed, allow_reduced_exposure
 		)
+		if cycle_event_callback is not None:
+			cycle_event_callback("stage", {"name": "Risk review"})
 		risk_input = {
 			"student": student,
 			"target_weights_json": _evidence_text(target_weights),
@@ -456,6 +473,8 @@ def run_crew(
 			}
 
 		phase_three_tasks = create_phase_three_tasks(agents, run_dir, stamp)
+		if cycle_event_callback is not None:
+			cycle_event_callback("stage", {"name": "Writing run report"})
 		phase_three_inputs = {
 			"execution_evidence": _evidence_text(execution),
 			"report_evidence": _evidence_text({"blend": blend, "validation": validation, "risk": risk_report, "execution": execution, "provider": selection.name}),
@@ -480,6 +499,7 @@ def run_crew(
 		"validation": validation,
 		"target_weights": target_weights,
 		"latest_prices": _latest_prices(bars),
+		"ohlcv_rows": bars.get("rows", []) if isinstance(bars, dict) else [],
 	}
 
 

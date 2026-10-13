@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -42,6 +43,28 @@ def test_dry_run_history_refresh_never_calls_yahoo(monkeypatch):
 	result = server.refresh_history(["AAPL"])
 
 	assert set(result["tickers"]) == {"AAPL", "SPY", "QQQ"}
+
+
+def test_config_reads_in_memory_student_override(monkeypatch):
+	override = {"student": "A", "high_beta": ["AAA"], "diversified": ["BBB"]}
+	monkeypatch.setenv("MCP_STUDENT_CONFIG_JSON", json.dumps({"A": override}))
+
+	assert server._config("A") == override
+
+
+def test_account_snapshot_preserves_zero_available_quantity(monkeypatch):
+	client = SimpleNamespace(
+		get_account=lambda: SimpleNamespace(equity="1000", portfolio_value="1000"),
+		get_all_positions=lambda: [
+			SimpleNamespace(symbol="AAA", qty="5", qty_available="0", side="long")
+		],
+	)
+	monkeypatch.setattr(server, "_account_client", lambda student: client)
+
+	_, positions = server._account_snapshot("A")
+
+	assert positions[0]["qty"] == 5.0
+	assert positions[0]["qty_available"] == 0.0
 
 
 def test_compute_indicators_returns_compact_finite_values(monkeypatch):
@@ -136,6 +159,60 @@ def test_validate_portfolio_rejects_low_high_beta_count_and_position_cap(monkeyp
 	over_cap.update({symbol: 0.79 / 9.0 for symbol in [*high_beta[1:], *diversified[:5]]})
 	with pytest.raises(ValueError, match="position_caps"):
 		server.validate_portfolio("A", over_cap, dry_run=True)
+
+
+def test_portfolio_diff_never_sells_more_than_held_or_opens_a_short(monkeypatch):
+	positions = [
+		{"symbol": "AAA", "qty": 2.0, "qty_available": 5.0, "side": "long"},
+		{"symbol": "BBB", "qty": 3.0, "qty_available": 3.0, "side": "short"},
+	]
+	monkeypatch.setattr(
+		server,
+		"_positions_for",
+		lambda student, dry_run: ({"portfolio_value": 1_000.0}, positions),
+	)
+	monkeypatch.setattr(
+		server,
+		"_market_frames",
+		lambda symbols, dry_run: {
+			symbol: pd.DataFrame({"close": [10.0]}) for symbol in symbols
+		},
+	)
+
+	result = server.portfolio_diff("A", {"AAA": 0.0, "BBB": 0.0}, dry_run=True)
+
+	assert result["orders"] == [
+		{"symbol": "AAA", "side": "sell", "qty": 2.0},
+		{"symbol": "BBB", "side": "buy", "qty": 3.0},
+	]
+	assert all(order["side"] != "sell" or order["qty"] <= 2.0 for order in result["orders"])
+
+
+def test_check_exits_respects_held_and_available_quantities(monkeypatch):
+	position = {
+		"symbol": "AAA",
+		"qty": 3.0,
+		"qty_available": 2.0,
+		"side": "long",
+		"avg_entry_price": 10.0,
+		"current_price": 10.0,
+		"market_value": 30.0,
+	}
+	frame = pd.DataFrame(
+		{"high": [100.0] * 20, "low": [9.0] * 20, "close": [10.0] * 20},
+		index=pd.date_range("2026-01-01", periods=20),
+	)
+	monkeypatch.setattr(server, "_positions_for", lambda student, dry_run: ({}, [position]))
+	monkeypatch.setattr(server, "_market_frames", lambda symbols, dry_run: {"AAA": frame})
+	monkeypatch.setattr(server.ta, "atr", lambda high, low, close, length: pd.Series(1.0, index=close.index))
+
+	result = server.check_exits("A", dry_run=True)
+
+	assert result["orders"] == [
+		{"symbol": "AAA", "side": "sell", "qty": 2.0, "reason": "atr_trailing_stop"}
+	]
+	position["qty_available"] = 0.0
+	assert server.check_exits("A", dry_run=True)["orders"] == []
 
 
 def test_place_orders_dry_run_never_requires_credentials_or_submits(monkeypatch):

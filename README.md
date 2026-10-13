@@ -14,7 +14,7 @@ Run `python backtest.py --student A` for a five-year walk-forward comparison. Th
 
 ## MCP Server
 
-`mcp_server/server.py` exposes the data, signal, portfolio, exit, account, and paper-order tools over FastMCP stdio. Account tools require a student key pair (`ALPACA_KEY_<student>` and `ALPACA_SECRET_<student>`); `place_orders` never submits unless `TRADING_ENABLED=true`, and all clients are paper-only. Run `python scripts/test_mcp.py --student A` to launch an isolated `MCP_DRY_RUN=1` server and call every tool without provider or account side effects.
+`mcp_server/server.py` exposes the data, signal, portfolio, exit, account, and paper-order tools over FastMCP stdio. With student credentials, dry-run tools read the paper account without submitting orders; credential-free dry tests use synthetic account data. Target diffs and exit signals are based on current positions, and sells are limited to available long shares. `place_orders` never submits unless `TRADING_ENABLED=true`, and all clients are paper-only. Run `python scripts/test_mcp.py --student A` to launch an isolated `MCP_DRY_RUN=1` server and call every tool without provider or account side effects.
 
 ## CrewAI Agents
 
@@ -30,4 +30,8 @@ Run `python backtest.py --student A` for a five-year walk-forward comparison. Th
 
 ## Daily Cycle Runner
 
-`run_cycle.py` checks Alpaca's market clock, skips a completed student/date cycle, refreshes data and retrains the ML signal through the crew, then validates and executes sells before buys. It writes peak equity and daily run status to `logs/<student>/state.json`, limits each order to $10,000, total target exposure to 100%, and each cycle to 10 orders. Set `TRADING_ENABLED=true` for `--mode live`; otherwise live requests are forced to dry mode. `--force-clock` bypasses the market clock for dry tests only. Run `python run_cycle.py --student A --mode dry`.
+`run_cycle.py` checks Alpaca's market clock, skips a completed student/date cycle, refreshes data and retrains the ML signal through the crew, then validates and executes sells before buys. It nets buys and sells to one order per symbol and caps sells at the currently available long quantity. Each order is limited to $10,000; total target exposure is limited to 100%. The daily cap is `max(20, configured stock count + 5)` when no target stocks are held or fewer than half are held, then returns to 10; the applied cap is printed and stored in `logs/<student>/state.json`. Skipped runs fetch a fresh Alpaca equity and position snapshot for the web console. Set `TRADING_ENABLED=true` for `--mode live`; otherwise live requests are forced to dry mode. `--force-clock` bypasses the market clock for dry tests only. Run `python run_cycle.py --student A --mode dry`.
+
+## Web Console
+
+`web/app.py` provides a local FastAPI dashboard for running the same cycle, editing per-run student symbols and signal weights, reviewing positions/orders/normalized portfolio-vs-SPY history, and optionally approving, editing downward, or rejecting capped orders. Alpaca credentials are held only in an in-memory browser session and are never written to config or logs. Start it with `python -m uvicorn web.app:app --host 127.0.0.1 --port 8000` and open `http://127.0.0.1:8000`.
