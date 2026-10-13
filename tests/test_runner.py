@@ -167,48 +167,84 @@ def test_trading_enabled_false_forces_live_request_to_dry(monkeypatch, tmp_path)
 	assert all(arguments["dry_run"] for arguments in placements)
 
 
-def test_completed_run_for_date_is_skipped(monkeypatch, tmp_path):
-	client, _, crew_calls = install_cycle_fakes(
-		monkeypatch,
-		tmp_path,
-		current_positions=[
-			SimpleNamespace(
-				symbol="AAPL",
-				qty="4",
-				qty_available="3",
-				side="long",
-				avg_entry_price="100",
-				market_value="440",
-				current_price="110",
-			)
-		],
-	)
-	events = []
+def _write_cycle_state(tmp_path, state):
 	state_path = tmp_path / "logs" / "A" / "state.json"
-	state_path.parent.mkdir(parents=True)
-	state_path.write_text(
-		json.dumps({"peak_equity": 100_000.0, "runs": {"2026-10-13": {"status": "completed"}}}),
-		encoding="utf-8",
+	state_path.parent.mkdir(parents=True, exist_ok=True)
+	state_path.write_text(json.dumps(state), encoding="utf-8")
+	return state_path
+
+
+def test_dry_after_dry_runs_again(monkeypatch, tmp_path):
+	monkeypatch.delenv("TRADING_ENABLED", raising=False)
+	_, _, crew_calls = install_cycle_fakes(monkeypatch, tmp_path)
+
+	assert run_cycle.run_cycle("A", "dry") == 0
+	assert run_cycle.run_cycle("A", "dry") == 0
+
+	assert len(crew_calls) == 2
+	assert not (tmp_path / "logs" / "A" / "state.json").exists()
+
+
+def test_dry_after_live_runs(monkeypatch, tmp_path):
+	monkeypatch.delenv("TRADING_ENABLED", raising=False)
+	_, _, crew_calls = install_cycle_fakes(monkeypatch, tmp_path)
+	state = {
+		"peak_equity": 110_000.0,
+		"runs": {"2026-10-13": {"status": "completed", "mode": "live"}},
+	}
+	state_path = _write_cycle_state(tmp_path, state)
+
+	assert run_cycle.run_cycle("A", "dry") == 0
+
+	assert len(crew_calls) == 1
+	assert json.loads(state_path.read_text(encoding="utf-8")) == state
+
+
+def test_live_after_dry_runs(monkeypatch, tmp_path):
+	monkeypatch.setenv("TRADING_ENABLED", "true")
+	_, _, crew_calls = install_cycle_fakes(monkeypatch, tmp_path)
+	state_path = _write_cycle_state(
+		tmp_path,
+		{"peak_equity": 100_000.0, "runs": {"2026-10-13": {"status": "completed", "mode": "dry"}}},
 	)
 
-	result = run_cycle.run_cycle("A", "dry", event_callback=lambda event, payload: events.append((event, payload)))
+	assert run_cycle.run_cycle("A", "live") == 0
 
-	assert result == 0
-	assert client.account_calls == 1
+	assert len(crew_calls) == 1
+	updated_state = json.loads(state_path.read_text(encoding="utf-8"))
+	assert updated_state["runs"]["2026-10-13"]["status"] == "completed"
+	assert updated_state["runs"]["2026-10-13"]["mode"] == "live"
+
+
+def test_live_after_live_is_skipped(monkeypatch, tmp_path):
+	monkeypatch.setenv("TRADING_ENABLED", "true")
+	_, _, crew_calls = install_cycle_fakes(monkeypatch, tmp_path)
+	_write_cycle_state(
+		tmp_path,
+		{"peak_equity": 100_000.0, "runs": {"2026-10-13": {"status": "completed", "mode": "live"}}},
+	)
+
+	assert run_cycle.run_cycle("A", "live") == 0
+
 	assert crew_calls == []
-	skip_payload = next(payload for event, payload in events if event == "cycle_skipped")
-	assert skip_payload["account_snapshot"]["account"]["equity"] == 100_000.0
-	assert skip_payload["account_snapshot"]["positions"] == [
-		{
-			"symbol": "AAPL",
-			"qty": 4.0,
-			"qty_available": 3.0,
-			"side": "long",
-			"avg_entry_price": 100.0,
-			"market_value": 440.0,
-			"current_price": 110.0,
-		}
-	]
+
+
+def test_dry_run_leaves_runs_and_peak_equity_unchanged(monkeypatch, tmp_path):
+	monkeypatch.delenv("TRADING_ENABLED", raising=False)
+	_, _, crew_calls = install_cycle_fakes(monkeypatch, tmp_path, equity=80_000.0)
+	state = {
+		"peak_equity": 120_000.0,
+		"runs": {
+			"2026-10-12": {"status": "completed", "mode": "live", "equity": 120_000.0},
+			"2026-10-13": {"status": "completed", "mode": "dry", "equity": 100_000.0},
+		},
+	}
+	state_path = _write_cycle_state(tmp_path, state)
+
+	assert run_cycle.run_cycle("A", "dry") == 0
+
+	assert len(crew_calls) == 1
+	assert json.loads(state_path.read_text(encoding="utf-8")) == state
 
 
 def test_drawdown_breaker_halves_targets_and_blocks_buys(monkeypatch, tmp_path):

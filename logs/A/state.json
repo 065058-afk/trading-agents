@@ -1,12 +1,4 @@
 {
   "peak_equity": 100000.0,
-  "runs": {
-    "2026-10-13": {
-      "drawdown_breaker": false,
-      "equity": 100000.0,
-      "mode": "dry",
-      "order_count": 10,
-      "status": "completed"
-    }
-  }
+  "runs": {}
 }

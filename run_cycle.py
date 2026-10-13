@@ -433,7 +433,12 @@ def run_cycle(
 		run_date = _today()
 		state_path = _state_path(student)
 		state = _load_state(state_path)
-		if state["runs"].get(run_date, {}).get("status") == "completed":
+		recorded_run = state["runs"].get(run_date, {})
+		if (
+			not dry_run
+			and recorded_run.get("status") == "completed"
+			and recorded_run.get("mode") == "live"
+		):
 			reason = f"A run for student {student} is already recorded for {run_date}; skipping."
 			if event_callback is not None:
 				if client is None:
@@ -480,16 +485,17 @@ def run_cycle(
 				event_callback,
 			),
 		)
-		state["peak_equity"] = max(peak_equity, equity)
-		state["runs"][run_date] = {
-			"status": "completed",
-			"mode": "dry" if dry_run else "live",
-			"equity": equity,
-			"drawdown_breaker": breaker_active,
-			"order_count": int(crew_result.get("execution", {}).get("order_count", 0)),
-			"daily_order_cap": crew_result.get("execution", {}).get("daily_order_cap"),
-		}
-		_write_state(state_path, state)
+		if not dry_run:
+			state["peak_equity"] = max(peak_equity, equity)
+			state["runs"][run_date] = {
+				"status": "completed",
+				"mode": "live",
+				"equity": equity,
+				"drawdown_breaker": breaker_active,
+				"order_count": int(crew_result.get("execution", {}).get("order_count", 0)),
+				"daily_order_cap": crew_result.get("execution", {}).get("daily_order_cap"),
+			}
+			_write_state(state_path, state)
 		if event_callback is not None:
 			event_callback("cycle_complete", crew_result)
 		print(f"Cycle complete for student {student} ({'dry' if dry_run else 'live'}).")
