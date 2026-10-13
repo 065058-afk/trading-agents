@@ -8,6 +8,10 @@ on:
       mode:
         description: "dry or live"
         default: "dry"
+      force_clock:
+        description: "Bypass the market clock in dry mode"
+        type: boolean
+        default: false
 concurrency:
   group: trade
   cancel-in-progress: false
@@ -36,10 +40,15 @@ jobs:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           TRADING_ENABLED: ${{ vars.TRADING_ENABLED }}
           MODE: ${{ github.event.inputs.mode || 'live' }}
+          FORCE_CLOCK: ${{ github.event.inputs.force_clock || 'false' }}
         run: |
           status=0
+          force_clock_args=()
+          if [[ "$MODE" == "dry" && "$FORCE_CLOCK" == "true" ]]; then
+            force_clock_args+=(--force-clock)
+          fi
           for s in A B C; do
-            python run_cycle.py --student $s --mode $MODE || status=1
+            python run_cycle.py --student "$s" --mode "$MODE" "${force_clock_args[@]}" || status=1
           done
           exit $status
       - name: Save logs, cache and models
