@@ -24,9 +24,10 @@ import requests
 import yaml
 from crewai import Crew, LLM, Process
 from crewai.tools import tool
-from crewai_tools import MCPServerAdapter
+from crewai_tools.adapters.mcp_adapter import CrewAIToolAdapter
 from dotenv import load_dotenv
 from mcp import StdioServerParameters
+from mcpadapt.core import MCPAdapt
 from pydantic import ValidationError
 
 if __package__ in {None, ""}:
@@ -47,6 +48,7 @@ LOGGER = logging.getLogger("trading_crew")
 GROQ_TOKENS_PER_MINUTE = 8_000
 LLM_MAX_TOKENS = 1_024
 QWEN3_MAX_TOKENS = 2_048
+MCP_TOOL_TIMEOUT_SECONDS = 120
 
 
 @dataclass(frozen=True)
@@ -604,9 +606,11 @@ def _validation_summary(validation: Any) -> dict[str, Any]:
 	if not isinstance(validation, Mapping):
 		return {"valid": False}
 	checks = validation.get("checks", {})
+	failures = validation.get("failures", [])
 	return {
 		"valid": validation.get("valid") is True,
 		"checks": dict(checks) if isinstance(checks, Mapping) else {},
+		"failures": list(failures) if isinstance(failures, list) else [],
 		"error": str(validation.get("error", ""))[:160] or None,
 	}
 
@@ -794,6 +798,7 @@ def run_crew(
 	config_override: Mapping[str, Any] | None = None,
 	credential_override: Mapping[str, str] | None = None,
 	cycle_event_callback: Callable[[str, Mapping[str, Any]], None] | None = None,
+	mcp_timeout_seconds: int = MCP_TOOL_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
 	student = student.upper()
 	if mode not in {"dry", "paper"}:
@@ -846,7 +851,13 @@ def run_crew(
 		cwd=ROOT,
 		env=server_env,
 	)
-	with MCPServerAdapter(server_params) as tool_collection:
+	mcp_timeout_seconds = max(MCP_TOOL_TIMEOUT_SECONDS, int(mcp_timeout_seconds))
+	with MCPAdapt(
+		server_params,
+		CrewAIToolAdapter(),
+		connect_timeout=mcp_timeout_seconds,
+		client_session_timeout_seconds=mcp_timeout_seconds,
+	) as tool_collection:
 		tool_map = {tool.name: tool for tool in tool_collection}
 		if cycle_event_callback is not None:
 			cycle_event_callback("stage", {"name": "Refreshing market data"})
@@ -856,10 +867,14 @@ def run_crew(
 		bars = _call_tool(tool_map, "get_ohlcv_batch", symbols=market_symbols, days=30, student=student)
 		indicators = _call_tool(tool_map, "compute_indicators", symbols=symbols)
 		headlines = _call_tool(tool_map, "news_fetch", symbols=symbols, student=student)
-		blend = (
-			_dry_blend_scores(student, symbols, config_override)
-			if mode == "dry"
-			else _call_tool(tool_map, "blend_scores", student=student, symbols=symbols)
+		for signal_name in ("signal_trend", "signal_rotation", "signal_breakout", "signal_dip", "signal_ml"):
+			_call_tool(tool_map, signal_name, symbols=symbols)
+		blend = _call_tool(
+			tool_map,
+			"blend_scores",
+			student=student,
+			symbols=symbols,
+			dry_run=(mode == "dry"),
 		)
 		if not isinstance(blend, dict) or not isinstance(blend.get("target_weights"), dict):
 			raise RuntimeError("blend_scores did not return MCP target_weights")

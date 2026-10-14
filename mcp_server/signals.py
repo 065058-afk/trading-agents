@@ -711,10 +711,16 @@ def _ask_groq(symbol: str, headlines: Sequence[str]) -> dict[str, Any]:
 	return _ask_groq_batch({symbol: headlines})[symbol]
 
 
-def signal_news_tilt(symbols: Sequence[str], *, student: str = "A") -> SignalScores:
+def signal_news_tilt(
+	symbols: Sequence[str],
+	*,
+	student: str = "A",
+	headlines_by_symbol: Mapping[str, Sequence[str]] | None = None,
+) -> SignalScores:
 	"""Return a capped headline tilt; strongly negative events are marked in ``.vetoes``."""
 	requested = _symbols(symbols)
-	headlines_by_symbol = _fetch_news_headlines(requested, student)
+	if headlines_by_symbol is None:
+		headlines_by_symbol = _fetch_news_headlines(requested, student)
 	scores: dict[str, float] = {}
 	vetoes: set[str] = set()
 	assessments = _ask_groq_batch(headlines_by_symbol)

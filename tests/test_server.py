@@ -110,6 +110,32 @@ def test_dry_blend_retrains_ml_without_persisting_a_model(monkeypatch):
 	assert calls == [(requested, set(requested), False, False)]
 
 
+def test_blend_scores_reuses_component_signals_from_same_cycle(monkeypatch):
+	monkeypatch.setenv("MCP_DRY_RUN", "1")
+	monkeypatch.setattr(server, "_SIGNAL_SCORE_CACHE", {})
+	config = server._config("A")
+	requested = [*config["high_beta"], *config["diversified"]]
+	calls = []
+
+	def fake_signal_call(name, symbols, as_of=None):
+		calls.append(name)
+		return {symbol: 0.25 for symbol in symbols}
+
+	monkeypatch.setattr(server, "_signal_call", fake_signal_call)
+	for name in ("signal_trend", "signal_rotation", "signal_breakout", "signal_dip", "signal_ml"):
+		getattr(server, name)(requested)
+	monkeypatch.setattr(
+		server.signal_engine,
+		"signal_ml",
+		lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("ML was recomputed")),
+	)
+
+	result = server.blend_scores("A", requested, dry_run=True)
+
+	assert calls == ["signal_trend", "signal_rotation", "signal_breakout", "signal_dip", "signal_ml"]
+	assert all(score == 0.25 for score in result["signal_scores"]["ml"].values())
+
+
 def test_earnings_guard_symbols_get_no_weight():
 	config = server._config("A")
 	symbols = [*config["high_beta"], *config["diversified"]]
@@ -127,10 +153,27 @@ def test_validate_portfolio_rejects_bad_count_and_insufficient_buying_power(monk
 	valid_weights = {symbol: 0.95 / len(symbols) for symbol in symbols}
 	monkeypatch.setattr(server, "_positions_for", lambda student, dry_run: (server._demo_account(student)[0], []))
 
-	with pytest.raises(ValueError, match="stock_count_10_to_15"):
-		server.validate_portfolio("A", {symbols[0]: 0.95}, dry_run=True)
-	with pytest.raises(ValueError, match="insufficient buying power"):
-		server.validate_portfolio("A", valid_weights, dry_run=True, required_buying_power=200_000)
+	bad_count = server.validate_portfolio(
+		"A", {symbols[0]: 1.2}, dry_run=True, required_buying_power=200_000
+	)
+	assert bad_count["valid"] is False
+	bad_count_rules = {failure["rule"] for failure in bad_count["failures"]}
+	assert {
+		"stock_count_10_to_15",
+		"position_caps",
+		"sum_of_weights",
+		"gross_exposure_90_to_100_percent",
+		"sufficient_buying_power",
+	} <= bad_count_rules
+	assert all({"rule", "value", "limit"} <= set(failure) for failure in bad_count["failures"])
+
+	low_buying_power = server.validate_portfolio(
+		"A", valid_weights, dry_run=True, required_buying_power=200_000
+	)
+	assert low_buying_power["valid"] is False
+	assert "sufficient_buying_power" in {
+		failure["rule"] for failure in low_buying_power["failures"]
+	}
 
 
 def test_validate_portfolio_allows_reduced_exposure_only_when_requested():
@@ -138,8 +181,11 @@ def test_validate_portfolio_allows_reduced_exposure_only_when_requested():
 	symbols = [*config["high_beta"][:5], *config["diversified"][:5]]
 	weights = {symbol: 0.05 for symbol in symbols}
 
-	with pytest.raises(ValueError, match="gross_exposure_90_to_100_percent"):
-		server.validate_portfolio("A", weights, dry_run=True)
+	result = server.validate_portfolio("A", weights, dry_run=True)
+	assert result["valid"] is False
+	assert "gross_exposure_90_to_100_percent" in {
+		failure["rule"] for failure in result["failures"]
+	}
 
 	result = server.validate_portfolio("A", weights, dry_run=True, allow_reduced_exposure=True)
 	assert result["valid"] is True
@@ -152,13 +198,31 @@ def test_validate_portfolio_rejects_low_high_beta_count_and_position_cap(monkeyp
 	diversified = config["diversified"]
 	monkeypatch.setattr(server, "_positions_for", lambda student, dry_run: (server._demo_account(student)[0], []))
 	too_few_high_beta = {high_beta[0]: 0.095, **{symbol: 0.095 for symbol in diversified[:9]}}
-	with pytest.raises(ValueError, match="high_beta_at_least_30_percent"):
-		server.validate_portfolio("A", too_few_high_beta, dry_run=True)
+	result = server.validate_portfolio("A", too_few_high_beta, dry_run=True)
+	assert "high_beta_at_least_30_percent" in {
+		failure["rule"] for failure in result["failures"]
+	}
 
 	over_cap = {high_beta[0]: 0.16}
 	over_cap.update({symbol: 0.79 / 9.0 for symbol in [*high_beta[1:], *diversified[:5]]})
-	with pytest.raises(ValueError, match="position_caps"):
-		server.validate_portfolio("A", over_cap, dry_run=True)
+	result = server.validate_portfolio("A", over_cap, dry_run=True)
+	assert "position_caps" in {failure["rule"] for failure in result["failures"]}
+
+
+def test_validate_portfolio_cap_tolerance_is_one_e_minus_six(monkeypatch):
+	config = server._config("A")
+	symbols = [*config["high_beta"], *config["diversified"]]
+	high_beta_symbol = config["high_beta"][0]
+	high_beta_weight = config["max_position_pct_high_beta"] + 5e-7
+	other_weight = (0.95 - high_beta_weight) / (len(symbols) - 1)
+	weights = {symbol: other_weight for symbol in symbols}
+	weights[high_beta_symbol] = high_beta_weight
+	monkeypatch.setattr(server, "_positions_for", lambda student, dry_run: (server._demo_account(student)[0], []))
+
+	result = server.validate_portfolio("A", weights, dry_run=True)
+
+	assert result["valid"] is True
+	assert result["checks"]["position_caps"] is True
 
 
 def test_portfolio_diff_never_sells_more_than_held_or_opens_a_short(monkeypatch):

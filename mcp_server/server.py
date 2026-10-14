@@ -31,6 +31,8 @@ CONFIG_DIR = ROOT / "config"
 OHLCV_COLUMNS = ("open", "high", "low", "close", "volume")
 STUDENT_CHOICES = {"A", "B", "C"}
 _SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9.-]*$")
+_SIGNAL_SCORE_CACHE: dict[tuple[str, tuple[str, ...], str | None], dict[str, float]] = {}
+_NEWS_HEADLINE_CACHE: dict[tuple[str, tuple[str, ...]], dict[str, list[str]]] = {}
 
 mcp = FastMCP("trading-agents", instructions="Paper-only trading tools. Set MCP_DRY_RUN=1 to disable all external calls.")
 
@@ -162,6 +164,22 @@ def _signal_call(name: str, symbols: Sequence[str], as_of: str | None = None) ->
 	if name == "signal_ml":
 		kwargs["persist"] = not is_dry
 	return {symbol: float(score) for symbol, score in function(requested, **kwargs).items()}
+
+
+def _cached_signal(name: str, symbols: Sequence[str]) -> dict[str, float] | None:
+	requested = tuple(symbols)
+	for (cached_name, cached_symbols, as_of), scores in reversed(list(_SIGNAL_SCORE_CACHE.items())):
+		if cached_name == name and as_of is None and set(requested) <= set(cached_symbols):
+			return {symbol: scores[symbol] for symbol in requested if symbol in scores}
+	return None
+
+
+def _cached_headlines(student: str, symbols: Sequence[str]) -> dict[str, list[str]] | None:
+	requested = tuple(symbols)
+	for (cached_student, cached_symbols), headlines in reversed(list(_NEWS_HEADLINE_CACHE.items())):
+		if cached_student == student and set(requested) <= set(cached_symbols):
+			return {symbol: list(headlines.get(symbol, [])) for symbol in requested}
+	return None
 
 
 def _capped_group_allocation(
@@ -411,7 +429,11 @@ def compute_indicators(symbols: list[str]) -> dict[str, Any]:
 
 def _register_price_signal(name: str):
 	def run(symbols: list[str], as_of: str | None = None) -> dict[str, float]:
-		return _signal_call(name, symbols, as_of)
+		requested = _normalize_symbols(symbols)
+		scores = _signal_call(name, requested, as_of)
+		cache_key = (name, tuple(requested), str(as_of) if as_of is not None else None)
+		_SIGNAL_SCORE_CACHE[cache_key] = scores
+		return scores
 
 	run.__name__ = name
 	run.__doc__ = f"Compute {name.replace('signal_', '')} scores in [-1, 1]."
@@ -429,9 +451,13 @@ signal_ml = _register_price_signal("signal_ml")
 @mcp.tool(description="Fetch Finnhub and Alpaca headlines for symbols; student selects Alpaca credentials.")
 def news_fetch(symbols: list[str], student: str) -> dict[str, list[str]]:
 	requested = _normalize_symbols(symbols)
+	student = student.strip().upper()
 	if _dry_run():
-		return {symbol: [f"Dry-run sample headline for {symbol}"] for symbol in requested}
-	return signal_engine._fetch_news_headlines(requested, student)
+		headlines = {symbol: [f"Dry-run sample headline for {symbol}"] for symbol in requested}
+	else:
+		headlines = signal_engine._fetch_news_headlines(requested, student)
+	_NEWS_HEADLINE_CACHE[(student, tuple(requested))] = headlines
+	return headlines
 
 
 @mcp.tool(description="Blend the student's configured signals, regime weights, earnings guard, and position caps.")
@@ -452,23 +478,30 @@ def blend_scores(
 			}
 			for signal_index, name in enumerate(("trend", "rotation", "breakout", "dip", "ml", "news"))
 		}
-		score_map["ml"] = signal_engine.signal_ml(
+		cached_ml = _cached_signal("signal_ml", requested)
+		score_map["ml"] = cached_ml if cached_ml is not None else signal_engine.signal_ml(
 			requested,
 			history=_market_frames(requested, dry_run=True),
 			persist=False,
 			walk_forward=False,
 		)
+		for name in ("trend", "rotation", "breakout", "dip"):
+			cached_scores = _cached_signal(f"signal_{name}", requested)
+			if cached_scores is not None:
+				score_map[name] = cached_scores
 		regime = "risk_on"
 		earnings: list[str] = []
 	else:
-		score_map = {
-			"trend": signal_engine.signal_trend(requested),
-			"rotation": signal_engine.signal_rotation(requested),
-			"breakout": signal_engine.signal_breakout(requested),
-			"dip": signal_engine.signal_dip(requested),
-			"ml": signal_engine.signal_ml(requested),
-			"news": signal_engine.signal_news_tilt(requested, student=student),
-		}
+		score_map = {}
+		for name in ("trend", "rotation", "breakout", "dip", "ml"):
+			cached_scores = _cached_signal(f"signal_{name}", requested)
+			function = getattr(signal_engine, f"signal_{name}")
+			score_map[name] = cached_scores if cached_scores is not None else function(requested)
+		score_map["news"] = signal_engine.signal_news_tilt(
+			requested,
+			student=student,
+			headlines_by_symbol=_cached_headlines(student, requested),
+		)
 		regime = signal_engine.regime_state()
 		earnings = signal_engine.earnings_guard(
 			requested, int(config["risk"].get("earnings_guard_days", 2))
@@ -492,19 +525,35 @@ def validate_portfolio(
 	checks["stock_count_10_to_15"] = 10 <= count <= 15
 	checks["high_beta_at_least_30_percent"] = len(set(weights) & high_beta) / max(count, 1) >= 0.30
 	checks["long_only"] = all(0.0 <= weight for weight in weights.values())
+	position_cap_violations = {
+		symbol: {
+			"weight": weight,
+			"cap": float(
+				config["max_position_pct_high_beta"]
+				if symbol in high_beta
+				else config["max_position_pct_diversified"]
+			),
+		}
+		for symbol, weight in weights.items()
+		if weight
+		> float(
+			config["max_position_pct_high_beta"]
+			if symbol in high_beta
+			else config["max_position_pct_diversified"]
+		)
+		+ 1e-6
+	}
 	checks["position_caps"] = all(
-		weight <= float(config["max_position_pct_high_beta"] if symbol in high_beta else config["max_position_pct_diversified"]) + 1e-9
+		weight <= float(config["max_position_pct_high_beta"] if symbol in high_beta else config["max_position_pct_diversified"]) + 1e-6
 		for symbol, weight in weights.items()
 	)
 	gross = sum(weights.values())
+	checks["sum_of_weights"] = 0.0 <= gross <= 1.000001
 	checks["gross_exposure_90_to_100_percent"] = (
 		0.0 <= gross <= 1.000001
 		if allow_reduced_exposure
 		else 0.90 <= gross <= 1.000001
 	)
-	if not all(checks.values()):
-		failed = [name for name, passed in checks.items() if not passed]
-		raise ValueError(f"Portfolio validation failed: {', '.join(failed)}")
 	account, positions = _positions_for(student, dry_run)
 	portfolio_value = float(account["portfolio_value"])
 	current_by_symbol = {position["symbol"]: abs(float(position["market_value"])) for position in positions}
@@ -518,12 +567,38 @@ def validate_portfolio(
 	)
 	available = float(account["buying_power"])
 	checks["sufficient_buying_power"] = needed <= available + max(0.01, abs(available) * 1e-9)
-	if not checks["sufficient_buying_power"]:
-		raise ValueError(
-			f"Portfolio validation failed: insufficient buying power (need ${needed:,.2f}, "
-			f"available ${available:,.2f})"
-		)
-	return {"valid": True, "checks": checks, "gross_exposure": gross, "required_buying_power": needed}
+	limits = {
+		"stock_count_10_to_15": "10-15 stocks",
+		"high_beta_at_least_30_percent": ">= 30% high-beta stocks",
+		"long_only": ">= 0 per-stock weight",
+		"position_caps": "high-beta <= configured cap; diversified <= configured cap",
+		"sum_of_weights": "0.0-1.000001",
+		"gross_exposure_90_to_100_percent": (
+			"0.0-1.000001" if allow_reduced_exposure else "0.90-1.000001"
+		),
+		"sufficient_buying_power": available,
+	}
+	values = {
+		"stock_count_10_to_15": count,
+		"high_beta_at_least_30_percent": len(set(weights) & high_beta) / max(count, 1),
+		"long_only": {symbol: weight for symbol, weight in weights.items() if weight < 0.0},
+		"position_caps": position_cap_violations,
+		"sum_of_weights": gross,
+		"gross_exposure_90_to_100_percent": gross,
+		"sufficient_buying_power": needed,
+	}
+	failures = [
+		{"rule": rule, "value": values[rule], "limit": limits[rule]}
+		for rule, passed in checks.items()
+		if not passed
+	]
+	return {
+		"valid": not failures,
+		"checks": checks,
+		"failures": failures,
+		"gross_exposure": gross,
+		"required_buying_power": needed,
+	}
 
 
 @mcp.tool(description="Diff target weights against current positions and return buy/sell quantities.")

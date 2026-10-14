@@ -491,8 +491,8 @@ def test_run_crew_survives_all_llm_calls_failing(monkeypatch, tmp_path, capsys):
 	llm = FakeLLM([MockHTTPError(429, 0, "never-log-this-key") for _ in range(10)])
 	monkeypatch.setattr("crew.crew._create_llm", lambda *args: llm)
 	monkeypatch.setattr("crew.crew.TokenPerMinuteLimiter", FakeLimiter)
-	monkeypatch.setattr("crew.crew._dry_blend_scores", lambda *args: blend)
 	calls = []
+	adapter_timeouts = []
 
 	class FakeMCPTool:
 		def __init__(self, name):
@@ -508,14 +508,21 @@ def test_run_crew_survives_all_llm_calls_failing(monkeypatch, tmp_path, capsys):
 				return {symbol: {"close": 100.0} for symbol in arguments["symbols"]}
 			if self.name == "news_fetch":
 				return {symbol: [f"Sample headline for {symbol}"] for symbol in arguments["symbols"]}
+			if self.name.startswith("signal_"):
+				return scores[self.name.removeprefix("signal_")]
+			if self.name == "blend_scores":
+				return blend
 			if self.name == "validate_portfolio":
 				return {"valid": True, "checks": {"gross_exposure": True}}
 			raise AssertionError(f"unexpected MCP tool: {self.name}")
 
 	class FakeAdapter:
-		def __init__(self, server_params):
+		def __init__(self, server_params, adapter, **kwargs):
+			adapter_timeouts.append(kwargs)
 			self.tools = [FakeMCPTool(name) for name in (
-				"refresh_history", "get_ohlcv_batch", "compute_indicators", "news_fetch", "validate_portfolio"
+				"refresh_history", "get_ohlcv_batch", "compute_indicators", "news_fetch",
+				"signal_trend", "signal_rotation", "signal_breakout", "signal_dip", "signal_ml",
+				"blend_scores", "validate_portfolio",
 			)]
 
 		def __enter__(self):
@@ -524,7 +531,7 @@ def test_run_crew_survives_all_llm_calls_failing(monkeypatch, tmp_path, capsys):
 		def __exit__(self, *args):
 			return False
 
-	monkeypatch.setattr("crew.crew.MCPServerAdapter", FakeAdapter)
+	monkeypatch.setattr("crew.crew.MCPAdapt", FakeAdapter)
 	execution_contexts = []
 	order = {"symbol": "AAPL", "side": "buy", "qty": 1.0}
 
@@ -545,6 +552,7 @@ def test_run_crew_survives_all_llm_calls_failing(monkeypatch, tmp_path, capsys):
 	)
 
 	assert result["risk_approved"] is True
+	assert adapter_timeouts == [{"connect_timeout": 120, "client_session_timeout_seconds": 120}]
 	assert "never-log-this-key" not in capsys.readouterr().out
 	assert execution_contexts[0]["risk_approved"] is True
 	assert calls.count(("validate_portfolio", {
