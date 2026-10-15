@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 
 import numpy as np
 import pandas as pd
@@ -206,6 +208,46 @@ def test_finnhub_auth_rejection_keeps_alpaca_headlines(monkeypatch, caplog):
     assert headlines["BBB"] == []
     assert "rejected-test-token" not in caplog.text
     assert "Alpaca headlines only" in caplog.text
+
+
+def test_news_headline_requests_are_concurrent_and_time_bounded(monkeypatch):
+    from alpaca.data.historical.news import NewsClient
+
+    symbols = ["AAA", "BBB", "CCC", "DDD", "EEE", "FFF"]
+    monkeypatch.setenv("FINNHUB_API_KEY", "finnhub-test-key")
+    monkeypatch.setenv("ALPACA_KEY_A", "alpaca-test-key")
+    monkeypatch.setenv("ALPACA_SECRET_A", "alpaca-test-secret")
+    monkeypatch.setattr(NewsClient, "get_news", lambda self, request: {"news": []})
+    active = 0
+    maximum_active = 0
+    lock = threading.Lock()
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return [{"headline": "Test headline"}]
+
+    def fake_get(url, *, headers, params, timeout):
+        nonlocal active, maximum_active
+        assert timeout == signals.NEWS_REQUEST_TIMEOUT_SECONDS
+        with lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        time.sleep(0.02)
+        with lock:
+            active -= 1
+        return Response()
+
+    monkeypatch.setattr(signals.requests, "get", fake_get)
+
+    result = signals._fetch_news_headlines(symbols, "A")
+
+    assert maximum_active > 1
+    assert all(result[symbol] == ["Test headline"] for symbol in symbols)
 
 
 def test_groq_uses_available_configured_model(monkeypatch):

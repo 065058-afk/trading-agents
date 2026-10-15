@@ -20,8 +20,13 @@ def test_registry_exposes_all_required_tools():
 		"signal_rotation",
 		"signal_breakout",
 		"signal_dip",
-		"signal_ml",
 		"news_fetch",
+		"start_signal_ml",
+		"get_signal_ml_result",
+		"start_signal_news_tilt",
+		"get_signal_news_tilt_result",
+		"signal_regime_state",
+		"signal_earnings_guard",
 		"blend_scores",
 		"validate_portfolio",
 		"portfolio_diff",
@@ -94,46 +99,43 @@ def test_blend_is_long_only_capped_and_in_configured_share_range(monkeypatch):
 	assert all(weights[symbol] <= config["max_position_pct_diversified"] for symbol in config["diversified"])
 
 
-def test_dry_blend_retrains_ml_without_persisting_a_model(monkeypatch):
-	monkeypatch.setenv("MCP_DRY_RUN", "1")
+def test_blend_scores_reads_complete_cycle_cache_only(monkeypatch, tmp_path):
+	monkeypatch.setattr(server, "_CYCLE_CACHE_DIR", tmp_path / "cycles")
 	config = server._config("A")
 	requested = [*config["high_beta"], *config["diversified"]]
-	calls = []
-
-	def fake_signal_ml(symbols, *, history, persist, walk_forward):
-		calls.append((list(symbols), set(history), persist, walk_forward))
-		return {symbol: 0.0 for symbol in symbols}
-
-	monkeypatch.setattr(server.signal_engine, "signal_ml", fake_signal_ml)
-	server.blend_scores("A", requested)
-
-	assert calls == [(requested, set(requested), False, False)]
-
-
-def test_blend_scores_reuses_component_signals_from_same_cycle(monkeypatch):
-	monkeypatch.setenv("MCP_DRY_RUN", "1")
-	monkeypatch.setattr(server, "_SIGNAL_SCORE_CACHE", {})
-	config = server._config("A")
-	requested = [*config["high_beta"], *config["diversified"]]
-	calls = []
-
-	def fake_signal_call(name, symbols, as_of=None):
-		calls.append(name)
-		return {symbol: 0.25 for symbol in symbols}
-
-	monkeypatch.setattr(server, "_signal_call", fake_signal_call)
-	for name in ("signal_trend", "signal_rotation", "signal_breakout", "signal_dip", "signal_ml"):
-		getattr(server, name)(requested)
+	cycle_id = "test-cycle"
+	components = {
+		name: {symbol: 0.25 for symbol in requested}
+		for name in ("trend", "rotation", "breakout", "dip", "ml", "news")
+	}
+	for name, scores in components.items():
+		server._store_cycle_component(cycle_id, "A", requested, name, scores)
+	server._store_cycle_component(cycle_id, "A", requested, "regime", "risk_on")
+	server._store_cycle_component(cycle_id, "A", requested, "earnings", [])
 	monkeypatch.setattr(
 		server.signal_engine,
 		"signal_ml",
-		lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("ML was recomputed")),
+		lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("ML ran inside blend")),
 	)
 
-	result = server.blend_scores("A", requested, dry_run=True)
+	result = server.blend_scores("A", requested, cycle_id=cycle_id)
 
-	assert calls == ["signal_trend", "signal_rotation", "signal_breakout", "signal_dip", "signal_ml"]
-	assert all(score == 0.25 for score in result["signal_scores"]["ml"].values())
+	assert len(result["target_weights"]) == 15
+	assert result["signal_scores"] == components
+	assert json.loads((tmp_path / "cycles" / f"{cycle_id}.json").read_text(encoding="utf-8"))["components"]["regime"] == "risk_on"
+	subset = [*config["high_beta"], *config["diversified"][:8]]
+	subset_result = server.blend_scores("A", subset, cycle_id=cycle_id)
+	assert len(subset_result["target_weights"]) == len(subset)
+
+
+def test_blend_scores_rejects_incomplete_cycle_cache(monkeypatch, tmp_path):
+	monkeypatch.setattr(server, "_CYCLE_CACHE_DIR", tmp_path / "cycles")
+	config = server._config("A")
+	requested = [*config["high_beta"], *config["diversified"]]
+	server._store_cycle_component("incomplete", "A", requested, "trend", {})
+
+	with pytest.raises(ValueError, match="missing prepared components"):
+		server.blend_scores("A", requested, cycle_id="incomplete")
 
 
 def test_earnings_guard_symbols_get_no_weight():

@@ -2,15 +2,24 @@
 
 from __future__ import annotations
 
+import anyio
+import contextlib
 import json
+import logging
 import math
 import os
 import re
 import sys
 import uuid
+import warnings
+from concurrent.futures import ProcessPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from threading import Lock
 from typing import Any, Mapping, Sequence
+
+logging.basicConfig(stream=sys.stderr, level=logging.WARNING, force=True)
+warnings.filterwarnings("ignore", category=Warning, module=r"^(numba|pandas_ta)(\.|$)")
 
 import numpy as np
 import pandas as pd
@@ -33,12 +42,137 @@ STUDENT_CHOICES = {"A", "B", "C"}
 _SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9.-]*$")
 _SIGNAL_SCORE_CACHE: dict[tuple[str, tuple[str, ...], str | None], dict[str, float]] = {}
 _NEWS_HEADLINE_CACHE: dict[tuple[str, tuple[str, ...]], dict[str, list[str]]] = {}
+_CYCLE_CACHE_DIR = Path(os.environ.get("MCP_CYCLE_CACHE_DIR", ROOT / "data" / "cache" / "cycles"))
+_CYCLE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_CYCLE_EXECUTOR = ProcessPoolExecutor(max_workers=2)
+_CYCLE_JOBS: dict[str, dict[str, Any]] = {}
+_CYCLE_JOBS_LOCK = Lock()
 
 mcp = FastMCP("trading-agents", instructions="Paper-only trading tools. Set MCP_DRY_RUN=1 to disable all external calls.")
 
 
 def _dry_run(dry_run: bool = False) -> bool:
 	return dry_run or os.environ.get("MCP_DRY_RUN", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _cycle_cache_path(cycle_id: str) -> Path:
+	if not _CYCLE_ID_RE.fullmatch(cycle_id):
+		raise ValueError("cycle_id must contain 1-64 letters, digits, underscores, or hyphens")
+	return _CYCLE_CACHE_DIR / f"{cycle_id}.json"
+
+
+def _read_cycle_cache(cycle_id: str) -> dict[str, Any]:
+	path = _cycle_cache_path(cycle_id)
+	try:
+		with path.open(encoding="utf-8") as cache_file:
+			result = json.load(cache_file)
+	except FileNotFoundError as error:
+		raise ValueError("No prepared component cache exists for this cycle") from error
+	if not isinstance(result, dict) or not isinstance(result.get("components"), dict):
+		raise ValueError("Cycle component cache is invalid")
+	return result
+
+
+def _store_cycle_component(
+	cycle_id: str,
+	student: str,
+	symbols: Sequence[str],
+	name: str,
+	value: Any,
+) -> None:
+	path = _cycle_cache_path(cycle_id)
+	path.parent.mkdir(parents=True, exist_ok=True)
+	requested = list(symbols)
+	if path.exists():
+		payload = _read_cycle_cache(cycle_id)
+		if payload.get("student") != student or payload.get("symbols") != requested:
+			raise ValueError("Cycle cache does not match this student and symbol basket")
+	else:
+		payload = {"cycle_id": cycle_id, "student": student, "symbols": requested, "components": {}}
+	payload["components"][name] = value
+	temporary_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+	try:
+		with temporary_path.open("w", encoding="utf-8") as cache_file:
+			json.dump(payload, cache_file, allow_nan=False)
+		os.replace(temporary_path, path)
+	finally:
+		temporary_path.unlink(missing_ok=True)
+
+
+def _compute_background_component(
+	name: str,
+	student: str,
+	symbols: list[str],
+	dry_run: bool,
+	headlines: Mapping[str, Sequence[str]] | None = None,
+) -> dict[str, float]:
+	with contextlib.redirect_stdout(sys.stderr):
+		if name == "ml":
+			if dry_run:
+				return signal_engine.signal_ml(
+					symbols,
+					history=_market_frames(symbols, dry_run=True),
+					persist=False,
+					walk_forward=False,
+				)
+			return signal_engine.signal_ml(symbols)
+		if name == "news":
+			if dry_run:
+				return {
+					symbol: float(((sum(ord(char) for char in symbol) + 65) % 101) / 100.0)
+					for symbol in symbols
+				}
+			return dict(
+				signal_engine.signal_news_tilt(
+					symbols,
+					student=student,
+					headlines_by_symbol=headlines,
+				)
+			)
+	raise ValueError(f"Unsupported background component: {name}")
+
+
+def _start_component_job(
+	name: str,
+	student: str,
+	symbols: list[str],
+	cycle_id: str,
+	dry_run: bool,
+	headlines: Mapping[str, Sequence[str]] | None = None,
+) -> dict[str, str]:
+	_cycle_cache_path(cycle_id)
+	job_id = uuid.uuid4().hex
+	future = _CYCLE_EXECUTOR.submit(
+		_compute_background_component, name, student, symbols, dry_run, headlines
+	)
+	with _CYCLE_JOBS_LOCK:
+		_CYCLE_JOBS[job_id] = {
+			"future": future,
+			"name": name,
+			"student": student,
+			"symbols": symbols,
+			"cycle_id": cycle_id,
+		}
+	return {"job_id": job_id, "status": "started"}
+
+
+def _component_job_result(job_id: str, expected_name: str) -> dict[str, Any]:
+	with _CYCLE_JOBS_LOCK:
+		job = _CYCLE_JOBS.get(job_id)
+	if job is None or job["name"] != expected_name:
+		raise ValueError("Unknown component job")
+	future = job["future"]
+	if not future.done():
+		return {"job_id": job_id, "status": "running"}
+	try:
+		scores = future.result()
+	except Exception as error:
+		return {"job_id": job_id, "status": "failed", "error": type(error).__name__}
+	component_name = "ml" if expected_name == "ml" else "news"
+	_store_cycle_component(
+		job["cycle_id"], job["student"], job["symbols"], component_name, scores
+	)
+	return {"job_id": job_id, "status": "completed", "scores": scores}
 
 
 def _normalize_symbols(symbols: Sequence[str]) -> list[str]:
@@ -428,11 +562,17 @@ def compute_indicators(symbols: list[str]) -> dict[str, Any]:
 
 
 def _register_price_signal(name: str):
-	def run(symbols: list[str], as_of: str | None = None) -> dict[str, float]:
+	async def run(
+		symbols: list[str],
+		cycle_id: str,
+		as_of: str | None = None,
+		student: str = "A",
+	) -> dict[str, float]:
 		requested = _normalize_symbols(symbols)
-		scores = _signal_call(name, requested, as_of)
+		scores = await anyio.to_thread.run_sync(_signal_call, name, requested, as_of)
 		cache_key = (name, tuple(requested), str(as_of) if as_of is not None else None)
 		_SIGNAL_SCORE_CACHE[cache_key] = scores
+		_store_cycle_component(cycle_id, student, requested, name.removeprefix("signal_"), scores)
 		return scores
 
 	run.__name__ = name
@@ -445,11 +585,12 @@ signal_trend = _register_price_signal("signal_trend")
 signal_rotation = _register_price_signal("signal_rotation")
 signal_breakout = _register_price_signal("signal_breakout")
 signal_dip = _register_price_signal("signal_dip")
-signal_ml = _register_price_signal("signal_ml")
 
 
 @mcp.tool(description="Fetch Finnhub and Alpaca headlines for symbols; student selects Alpaca credentials.")
-def news_fetch(symbols: list[str], student: str) -> dict[str, list[str]]:
+def news_fetch(
+	symbols: list[str], student: str, cycle_id: str | None = None
+) -> dict[str, list[str]]:
 	requested = _normalize_symbols(symbols)
 	student = student.strip().upper()
 	if _dry_run():
@@ -457,56 +598,99 @@ def news_fetch(symbols: list[str], student: str) -> dict[str, list[str]]:
 	else:
 		headlines = signal_engine._fetch_news_headlines(requested, student)
 	_NEWS_HEADLINE_CACHE[(student, tuple(requested))] = headlines
+	if cycle_id is not None:
+		_store_cycle_component(cycle_id, student, requested, "headlines", headlines)
 	return headlines
 
 
-@mcp.tool(description="Blend the student's configured signals, regime weights, earnings guard, and position caps.")
+@mcp.tool(description="Start ML signal computation for a cycle; poll get_signal_ml_result for completion.")
+def start_signal_ml(
+	student: str, symbols: list[str], cycle_id: str, dry_run: bool = False
+) -> dict[str, str]:
+	requested = _normalize_symbols(symbols)
+	return _start_component_job("ml", student.strip().upper(), requested, cycle_id, _dry_run(dry_run))
+
+
+@mcp.tool(description="Poll an ML signal job and persist its result in the cycle cache when complete.")
+def get_signal_ml_result(job_id: str) -> dict[str, Any]:
+	return _component_job_result(job_id, "ml")
+
+
+@mcp.tool(description="Start headline news assessment for a cycle; poll get_signal_news_tilt_result for completion.")
+def start_signal_news_tilt(
+	student: str, symbols: list[str], cycle_id: str, dry_run: bool = False
+) -> dict[str, str]:
+	requested = _normalize_symbols(symbols)
+	student = student.strip().upper()
+	headlines = _cached_headlines(student, requested)
+	if headlines is None:
+		cached = _read_cycle_cache(cycle_id)["components"].get("headlines")
+		if not isinstance(cached, dict):
+			raise ValueError("news_fetch must complete before news tilt starts")
+		headlines = cached
+	return _start_component_job(
+		"news", student, requested, cycle_id, _dry_run(dry_run), headlines
+	)
+
+
+@mcp.tool(description="Poll a news assessment job and persist its result in the cycle cache when complete.")
+def get_signal_news_tilt_result(job_id: str) -> dict[str, Any]:
+	return _component_job_result(job_id, "news")
+
+
+@mcp.tool(description="Compute and cache the market regime state for a cycle.")
+def signal_regime_state(symbols: list[str], student: str, cycle_id: str) -> str:
+	requested = _normalize_symbols(symbols)
+	regime = "risk_on" if _dry_run() else signal_engine.regime_state()
+	_store_cycle_component(cycle_id, student.strip().upper(), requested, "regime", regime)
+	return regime
+
+
+@mcp.tool(description="Compute and cache the upcoming-earnings guard for a cycle.")
+def signal_earnings_guard(symbols: list[str], student: str, cycle_id: str) -> list[str]:
+	requested = _normalize_symbols(symbols)
+	student = student.strip().upper()
+	days = int(_config(student)["risk"].get("earnings_guard_days", 2))
+	guarded = [] if _dry_run() else signal_engine.earnings_guard(requested, days)
+	_store_cycle_component(cycle_id, student, requested, "earnings", guarded)
+	return guarded
+
+
+@mcp.tool(description="Combine prepared per-cycle signals into the student's capped target weights.")
 def blend_scores(
 	student: str,
 	symbols: list[str] | None = None,
 	dry_run: bool | None = None,
 	config_override: dict[str, Any] | None = None,
+	cycle_id: str | None = None,
 ) -> dict[str, Any]:
 	config = dict(config_override) if config_override is not None else _config(student)
 	requested = list(dict.fromkeys([*config["high_beta"], *config["diversified"]])) if symbols is None else _normalize_symbols(symbols)
-	is_dry = _dry_run() if dry_run is None else dry_run
-	if is_dry:
-		score_map = {
-			name: {
-				symbol: float(((sum(ord(char) for char in symbol) + signal_index * 13) % 101) / 100.0)
-				for symbol in requested
-			}
-			for signal_index, name in enumerate(("trend", "rotation", "breakout", "dip", "ml", "news"))
-		}
-		cached_ml = _cached_signal("signal_ml", requested)
-		score_map["ml"] = cached_ml if cached_ml is not None else signal_engine.signal_ml(
-			requested,
-			history=_market_frames(requested, dry_run=True),
-			persist=False,
-			walk_forward=False,
-		)
-		for name in ("trend", "rotation", "breakout", "dip"):
-			cached_scores = _cached_signal(f"signal_{name}", requested)
-			if cached_scores is not None:
-				score_map[name] = cached_scores
-		regime = "risk_on"
-		earnings: list[str] = []
-	else:
-		score_map = {}
-		for name in ("trend", "rotation", "breakout", "dip", "ml"):
-			cached_scores = _cached_signal(f"signal_{name}", requested)
-			function = getattr(signal_engine, f"signal_{name}")
-			score_map[name] = cached_scores if cached_scores is not None else function(requested)
-		score_map["news"] = signal_engine.signal_news_tilt(
-			requested,
-			student=student,
-			headlines_by_symbol=_cached_headlines(student, requested),
-		)
-		regime = signal_engine.regime_state()
-		earnings = signal_engine.earnings_guard(
-			requested, int(config["risk"].get("earnings_guard_days", 2))
-		)
-	return _blend_from_scores(student, requested, score_map, regime, earnings, config)
+	if cycle_id is None:
+		raise ValueError("cycle_id is required; prepare components before blending")
+	cache = _read_cycle_cache(cycle_id)
+	cached_symbols = cache.get("symbols")
+	if (
+		cache.get("student") != student.strip().upper()
+		or not isinstance(cached_symbols, list)
+		or not set(requested) <= set(cached_symbols)
+	):
+		raise ValueError("Cycle component cache does not match this student and symbol basket")
+	components = cache["components"]
+	component_names = ("trend", "rotation", "breakout", "dip", "ml", "news")
+	missing = [name for name in (*component_names, "regime", "earnings") if name not in components]
+	if missing:
+		raise ValueError(f"Cycle is missing prepared components: {', '.join(missing)}")
+	score_map = {
+		name: {symbol: float(components[name][symbol]) for symbol in requested}
+		for name in component_names
+	}
+	return _blend_from_scores(
+		student, requested, score_map, components["regime"], components["earnings"], config
+	)
+
+
+_blend_scores_sync = blend_scores
 
 
 @mcp.tool(description="Validate basket size, high-beta count, position caps, long-only gross exposure, and account buying power.")

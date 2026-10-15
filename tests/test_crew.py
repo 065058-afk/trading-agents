@@ -12,7 +12,6 @@ from crew.crew import (
 	TokenPerMinuteLimiter,
 	_call_agent_report,
 	_create_llm,
-	_dry_blend_scores,
 	_create_risk_validation_tool,
 	_retry_after_seconds,
 	_score_summary,
@@ -508,6 +507,16 @@ def test_run_crew_survives_all_llm_calls_failing(monkeypatch, tmp_path, capsys):
 				return {symbol: {"close": 100.0} for symbol in arguments["symbols"]}
 			if self.name == "news_fetch":
 				return {symbol: [f"Sample headline for {symbol}"] for symbol in arguments["symbols"]}
+			if self.name.startswith("start_signal_"):
+				return {"job_id": self.name, "status": "started"}
+			if self.name == "get_signal_ml_result":
+				return {"job_id": "start_signal_ml", "status": "completed", "scores": scores["ml"]}
+			if self.name == "get_signal_news_tilt_result":
+				return {"job_id": "start_signal_news_tilt", "status": "completed", "scores": scores["news"]}
+			if self.name == "signal_regime_state":
+				return "risk_on"
+			if self.name == "signal_earnings_guard":
+				return []
 			if self.name.startswith("signal_"):
 				return scores[self.name.removeprefix("signal_")]
 			if self.name == "blend_scores":
@@ -521,7 +530,9 @@ def test_run_crew_survives_all_llm_calls_failing(monkeypatch, tmp_path, capsys):
 			adapter_timeouts.append(kwargs)
 			self.tools = [FakeMCPTool(name) for name in (
 				"refresh_history", "get_ohlcv_batch", "compute_indicators", "news_fetch",
-				"signal_trend", "signal_rotation", "signal_breakout", "signal_dip", "signal_ml",
+				"signal_trend", "signal_rotation", "signal_breakout", "signal_dip",
+				"start_signal_ml", "get_signal_ml_result", "start_signal_news_tilt",
+				"get_signal_news_tilt_result", "signal_regime_state", "signal_earnings_guard",
 				"blend_scores", "validate_portfolio",
 			)]
 
@@ -552,7 +563,7 @@ def test_run_crew_survives_all_llm_calls_failing(monkeypatch, tmp_path, capsys):
 	)
 
 	assert result["risk_approved"] is True
-	assert adapter_timeouts == [{"connect_timeout": 120, "client_session_timeout_seconds": 120}]
+	assert adapter_timeouts == [{"connect_timeout": 120, "client_session_timeout_seconds": 120.0}]
 	assert "never-log-this-key" not in capsys.readouterr().out
 	assert execution_contexts[0]["risk_approved"] is True
 	assert calls.count(("validate_portfolio", {
@@ -581,20 +592,14 @@ def test_target_weight_scaling_enforces_total_exposure_cap():
 	assert sum(breaker_weights.values()) == pytest.approx(0.45)
 
 
-def test_dry_blend_uses_local_mcp_logic_with_dry_flag(monkeypatch):
-	calls = []
+def test_dry_blend_uses_local_combiner():
+	from mcp_server.server import _config
 
-	def fake_blend_scores(student, symbols, *, dry_run, config_override):
-		calls.append((student, symbols, dry_run, config_override))
-		return {"target_weights": {"AAA": 1.0}}
+	config = _config("A")
+	symbols = [*config["high_beta"], *config["diversified"]]
+	result = __import__("crew.crew", fromlist=["_dry_blend_scores"])._dry_blend_scores("A", symbols)
 
-	monkeypatch.setattr("mcp_server.server.blend_scores", fake_blend_scores)
-	monkeypatch.delenv("MCP_DRY_RUN", raising=False)
-
-	result = _dry_blend_scores("A", ["AAA"])
-
-	assert result == {"target_weights": {"AAA": 1.0}}
-	assert calls == [("A", ["AAA"], True, None)]
+	assert len(result["target_weights"]) == 15
 
 
 def test_phase_layout_limits_llm_tasks_and_names_agent_files(tmp_path):

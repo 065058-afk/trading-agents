@@ -10,6 +10,7 @@ import sys
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
+import uuid
 
 import yaml
 from mcp import ClientSession, StdioServerParameters
@@ -97,6 +98,10 @@ async def _run(student: str) -> None:
 	symbols = list(dict.fromkeys([*config["high_beta"], *config["diversified"]]))
 	environment = os.environ.copy()
 	environment["MCP_DRY_RUN"] = "1"
+	environment["TRADING_ENABLED"] = "false"
+	for student_suffix in ("A", "B", "C"):
+		environment[f"ALPACA_KEY_{student_suffix}"] = ""
+		environment[f"ALPACA_SECRET_{student_suffix}"] = ""
 	server = StdioServerParameters(
 		command=sys.executable,
 		args=[str(ROOT / "mcp_server" / "server.py")],
@@ -112,8 +117,13 @@ async def _run(student: str) -> None:
 		"signal_rotation",
 		"signal_breakout",
 		"signal_dip",
-		"signal_ml",
 		"news_fetch",
+		"start_signal_ml",
+		"get_signal_ml_result",
+		"start_signal_news_tilt",
+		"get_signal_news_tilt_result",
+		"signal_regime_state",
+		"signal_earnings_guard",
 		"blend_scores",
 		"validate_portfolio",
 		"portfolio_diff",
@@ -160,21 +170,47 @@ async def _run(student: str) -> None:
 				elapsed = asyncio.get_running_loop().time() - started
 				failures.append(f"{name}: {last_error}")
 				print(f"FAILED {name} after retry: {last_error}; elapsed={elapsed:.2f}s", flush=True)
-				return None
+				raise RuntimeError(f"{name} failed after retry: {last_error}")
 
 			student_arg = {"student": student}
+			cycle_id = uuid.uuid4().hex
 			await call("get_ohlcv_batch", {**student_arg, "symbols": symbols[:2], "days": 5})
 			await call("refresh_history", {"symbols": symbols[:2]})
 			await call("compute_indicators", {"symbols": symbols[:2]})
-			for name in ("signal_trend", "signal_rotation", "signal_breakout", "signal_dip", "signal_ml"):
-				await call(name, {"symbols": symbols})
-			await call("news_fetch", {**student_arg, "symbols": symbols})
-			blend = await call("blend_scores", {**student_arg, "symbols": symbols})
+			await call("news_fetch", {**student_arg, "symbols": symbols, "cycle_id": cycle_id})
+			for name in ("signal_trend", "signal_rotation", "signal_breakout", "signal_dip"):
+				await call(name, {**student_arg, "symbols": symbols, "cycle_id": cycle_id})
+			ml_job = await call("start_signal_ml", {**student_arg, "symbols": symbols, "cycle_id": cycle_id, "dry_run": True})
+			news_job = await call("start_signal_news_tilt", {**student_arg, "symbols": symbols, "cycle_id": cycle_id, "dry_run": True})
+			await call("signal_regime_state", {**student_arg, "symbols": symbols, "cycle_id": cycle_id})
+			await call("signal_earnings_guard", {**student_arg, "symbols": symbols, "cycle_id": cycle_id})
+
+			async def poll_job(job: Any, tool_name: str) -> Any:
+				if not isinstance(job, dict) or not isinstance(job.get("job_id"), str):
+					raise RuntimeError(f"{tool_name} did not return a job id")
+				deadline = asyncio.get_running_loop().time() + MCP_TOOL_TIMEOUT_SECONDS
+				while asyncio.get_running_loop().time() < deadline:
+					result = await call(tool_name, {"job_id": job["job_id"]})
+					if isinstance(result, dict) and result.get("status") == "completed":
+						return result
+					if isinstance(result, dict) and result.get("status") == "failed":
+						raise RuntimeError(f"{tool_name} failed: {result.get('error', 'unknown error')}")
+					if not isinstance(result, dict) or result.get("status") != "running":
+						raise RuntimeError(f"{tool_name} returned an invalid job status")
+					await asyncio.sleep(0.25)
+				raise TimeoutError(f"{tool_name} exceeded the {MCP_TOOL_TIMEOUT_SECONDS}s deadline")
+
+			await poll_job(ml_job, "get_signal_ml_result")
+			await poll_job(news_job, "get_signal_news_tilt_result")
+			blend = await call("blend_scores", {**student_arg, "symbols": symbols, "cycle_id": cycle_id})
+			if not isinstance(blend, dict) or not isinstance(blend.get("target_weights"), dict):
+				raise RuntimeError("blend_scores returned no target_weights; refusing to continue")
 			validation_symbols = _validation_symbols(config, symbols)
 			validation_blend = blend
 			if validation_symbols != symbols:
 				validation_blend = await call(
-					"blend_scores", {**student_arg, "symbols": validation_symbols}
+					"blend_scores",
+					{**student_arg, "symbols": validation_symbols, "cycle_id": cycle_id},
 				)
 			if isinstance(validation_blend, dict) and isinstance(validation_blend.get("target_weights"), dict):
 				target_weights = validation_blend["target_weights"]

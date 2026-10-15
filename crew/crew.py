@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -439,18 +440,36 @@ def _call_tool(tool_map: Mapping[str, Any], name: str, **arguments: Any) -> Any:
 	return _decode_tool_result(tool.run(**arguments))
 
 
+def _poll_component_job(
+	tool_map: Mapping[str, Any], poll_tool: str, job_id: str
+) -> dict[str, float]:
+	deadline = time.monotonic() + MCP_TOOL_TIMEOUT_SECONDS
+	while time.monotonic() < deadline:
+		result = _call_tool(tool_map, poll_tool, job_id=job_id)
+		if not isinstance(result, dict):
+			raise RuntimeError(f"{poll_tool} returned an invalid job result")
+		if result.get("status") == "completed" and isinstance(result.get("scores"), dict):
+			return result["scores"]
+		if result.get("status") == "failed":
+			raise RuntimeError(f"{poll_tool} failed: {result.get('error', 'unknown error')}")
+		if result.get("status") != "running":
+			raise RuntimeError(f"{poll_tool} returned an unexpected job status")
+		time.sleep(0.25)
+	raise TimeoutError(f"{poll_tool} exceeded the {MCP_TOOL_TIMEOUT_SECONDS}s cycle deadline")
+
+
 
 def _dry_blend_scores(
 	student: str, symbols: list[str], config_override: Mapping[str, Any] | None = None
 ) -> dict[str, Any]:
-	from mcp_server.server import blend_scores
+	from mcp_server.server import _blend_from_scores, _config
 
-	return blend_scores(
-		student,
-		symbols,
-		dry_run=True,
-		config_override=dict(config_override) if config_override is not None else None,
-	)
+	config = dict(config_override) if config_override is not None else _config(student)
+	scores = {
+		name: {symbol: 0.0 for symbol in symbols}
+		for name in ("trend", "rotation", "breakout", "dip", "ml", "news")
+	}
+	return _blend_from_scores(student, symbols, scores, "risk_on", [], config)
 
 
 def _create_risk_validation_tool(mcp_tool: Any, breaker_allows_reduced_exposure: bool = False) -> Any:
@@ -851,12 +870,13 @@ def run_crew(
 		cwd=ROOT,
 		env=server_env,
 	)
+	cycle_id = uuid.uuid4().hex
 	mcp_timeout_seconds = max(MCP_TOOL_TIMEOUT_SECONDS, int(mcp_timeout_seconds))
 	with MCPAdapt(
 		server_params,
 		CrewAIToolAdapter(),
 		connect_timeout=mcp_timeout_seconds,
-		client_session_timeout_seconds=mcp_timeout_seconds,
+		client_session_timeout_seconds=float(mcp_timeout_seconds),
 	) as tool_collection:
 		tool_map = {tool.name: tool for tool in tool_collection}
 		if cycle_event_callback is not None:
@@ -866,15 +886,53 @@ def run_crew(
 		market_symbols = list(dict.fromkeys([*symbols, "SPY"]))
 		bars = _call_tool(tool_map, "get_ohlcv_batch", symbols=market_symbols, days=30, student=student)
 		indicators = _call_tool(tool_map, "compute_indicators", symbols=symbols)
-		headlines = _call_tool(tool_map, "news_fetch", symbols=symbols, student=student)
-		for signal_name in ("signal_trend", "signal_rotation", "signal_breakout", "signal_dip", "signal_ml"):
-			_call_tool(tool_map, signal_name, symbols=symbols)
+		headlines = _call_tool(
+			tool_map, "news_fetch", symbols=symbols, student=student, cycle_id=cycle_id
+		)
+		for signal_name in ("signal_trend", "signal_rotation", "signal_breakout", "signal_dip"):
+			_call_tool(
+				tool_map,
+				signal_name,
+				symbols=symbols,
+				student=student,
+				cycle_id=cycle_id,
+			)
+		ml_job = _call_tool(
+			tool_map,
+			"start_signal_ml",
+			student=student,
+			symbols=symbols,
+			cycle_id=cycle_id,
+			dry_run=(mode == "dry"),
+		)
+		news_job = _call_tool(
+			tool_map,
+			"start_signal_news_tilt",
+			student=student,
+			symbols=symbols,
+			cycle_id=cycle_id,
+			dry_run=(mode == "dry"),
+		)
+		_call_tool(
+			tool_map, "signal_regime_state", symbols=symbols, student=student, cycle_id=cycle_id
+		)
+		_call_tool(
+			tool_map, "signal_earnings_guard", symbols=symbols, student=student, cycle_id=cycle_id
+		)
+		for job, poll_tool in (
+			(ml_job, "get_signal_ml_result"),
+			(news_job, "get_signal_news_tilt_result"),
+		):
+			if not isinstance(job, dict) or not isinstance(job.get("job_id"), str):
+				raise RuntimeError(f"{poll_tool} was not started successfully")
+			_poll_component_job(tool_map, poll_tool, job["job_id"])
 		blend = _call_tool(
 			tool_map,
 			"blend_scores",
 			student=student,
 			symbols=symbols,
 			dry_run=(mode == "dry"),
+			cycle_id=cycle_id,
 		)
 		if not isinstance(blend, dict) or not isinstance(blend.get("target_weights"), dict):
 			raise RuntimeError("blend_scores did not return MCP target_weights")
