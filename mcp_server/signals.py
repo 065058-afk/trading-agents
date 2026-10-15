@@ -9,6 +9,7 @@ import os
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -57,6 +58,7 @@ STRONG_NEGATIVE_EVENTS = {
 	"accounting_irregularity",
 	"restatement",
 }
+NEWS_REQUEST_TIMEOUT_SECONDS = 15
 FINNHUB_NEWS_WORKERS = 5
 LOGGER = logging.getLogger(__name__)
 
@@ -532,6 +534,10 @@ def _fetch_news_headlines(symbols: Sequence[str], student: str) -> dict[str, lis
 
 	start = datetime.now(timezone.utc) - timedelta(days=3)
 	news_client = NewsClient(alpaca_key, alpaca_secret)
+	news_client._session.request = partial(
+		news_client._session.request,
+		timeout=NEWS_REQUEST_TIMEOUT_SECONDS,
+	)
 	response = news_client.get_news(
 		NewsRequest(symbols=",".join(symbols), start=start, sort="desc", limit=100, exclude_contentless=True)
 	)
@@ -551,6 +557,7 @@ def _fetch_news_headlines(symbols: Sequence[str], student: str) -> dict[str, lis
 			f"{FINNHUB_URL}/company-news",
 			headers={"X-Finnhub-Token": finnhub_key},
 			params={"symbol": symbol, "from": date_from, "to": date_to},
+			timeout=NEWS_REQUEST_TIMEOUT_SECONDS,
 		)
 		try:
 			_check_finnhub_response(result)
@@ -685,6 +692,7 @@ def _ask_groq_batch(
 					{"role": "user", "content": json.dumps(prompt)},
 				],
 			},
+			timeout=30,
 		)
 	except requests.exceptions.RequestException as error:
 		return _neutral_groq_assessments(
@@ -769,6 +777,7 @@ def earnings_guard(symbols: Sequence[str], days: int) -> list[str]:
 			"from": today.isoformat(),
 			"to": (today + timedelta(days=days)).isoformat(),
 		},
+		timeout=15,
 	)
 	_check_finnhub_response(result)
 	calendar = result.json().get("earningsCalendar", [])

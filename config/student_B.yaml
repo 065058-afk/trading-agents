@@ -16,6 +16,7 @@ risk:
   earnings_guard_days: 2
 llm:
   temperature: 0.1
+  timeout_seconds: 60
   max_tokens: 1024
   provider_order: [ollama_local, ollama_cloud, groq]
   providers:

@@ -210,7 +210,7 @@ def test_finnhub_auth_rejection_keeps_alpaca_headlines(monkeypatch, caplog):
     assert "Alpaca headlines only" in caplog.text
 
 
-def test_news_headline_requests_are_concurrent(monkeypatch):
+def test_news_headline_requests_are_concurrent_and_time_bounded(monkeypatch):
     from alpaca.data.historical.news import NewsClient
 
     symbols = ["AAA", "BBB", "CCC", "DDD", "EEE", "FFF"]
@@ -231,8 +231,9 @@ def test_news_headline_requests_are_concurrent(monkeypatch):
         def json(self):
             return [{"headline": "Test headline"}]
 
-    def fake_get(url, *, headers, params):
+    def fake_get(url, *, headers, params, timeout):
         nonlocal active, maximum_active
+        assert timeout == signals.NEWS_REQUEST_TIMEOUT_SECONDS
         with lock:
             active += 1
             maximum_active = max(maximum_active, active)

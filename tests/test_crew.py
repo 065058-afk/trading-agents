@@ -136,7 +136,7 @@ def test_native_groq_llm_uses_model_id_verbatim():
 		"https://api.groq.com/openai/v1",
 		"test-only",
 	)
-	llm = _create_llm(selection, 0.1)
+	llm = _create_llm(selection, 0.1, 30)
 
 	assert type(llm).__name__ == "OpenAICompletion"
 	assert llm.model == "openai/gpt-oss-20b"
@@ -150,7 +150,7 @@ def test_ollama_cloud_adds_openai_compatible_api_path():
 		"https://ollama.com",
 		"test-only",
 	)
-	llm = _create_llm(selection, 0.1)
+	llm = _create_llm(selection, 0.1, 30)
 
 	assert llm.model == "gpt-oss:20b"
 	assert str(llm.base_url) == "https://ollama.com/v1"
@@ -159,14 +159,14 @@ def test_ollama_cloud_adds_openai_compatible_api_path():
 def test_local_qwen3_disables_thinking_to_avoid_json_truncation():
 	selection = ProviderSelection("ollama_local", "qwen3:0.6b", "http://localhost:11434", None)
 
-	llm = _create_llm(selection, 0.1)
+	llm = _create_llm(selection, 0.1, 30)
 
 	assert llm.additional_params["extra_body"]["think"] is False
 
 
 def test_llm_caps_completion_tokens():
 	selection = ProviderSelection("groq", "openai/gpt-oss-20b", "https://api.groq.test/v1", "test-only")
-	llm = _create_llm(selection, 0.1, max_tokens=256)
+	llm = _create_llm(selection, 0.1, 30, max_tokens=256)
 
 	assert llm.max_tokens == 256
 
@@ -174,12 +174,12 @@ def test_llm_caps_completion_tokens():
 def test_groq_gpt_oss_uses_low_reasoning_effort():
 	selection = ProviderSelection("groq", "openai/gpt-oss-20b", "https://api.groq.test/v1", "test-only")
 
-	llm = _create_llm(selection, 0.1)
+	llm = _create_llm(selection, 0.1, 30)
 
 	assert llm.reasoning_effort == "low"
 	assert llm.max_tokens == 1024
 
-	plain_llm = _create_llm(selection, 0.1, structured=False)
+	plain_llm = _create_llm(selection, 0.1, 30, structured=False)
 	assert plain_llm.response_format is None
 
 
@@ -223,6 +223,7 @@ class FakeLLM:
 def _fallback_settings():
 	return {
 		"temperature": 0.1,
+		"timeout_seconds": 5,
 		"provider_order": ["groq", "ollama_cloud"],
 		"providers": {
 			"groq": {"model": "openai/gpt-oss-20b", "base_url": "https://api.groq.test/v1"},
@@ -356,7 +357,7 @@ def test_agent_report_uses_configured_completion_token_limit(monkeypatch):
 	settings["max_tokens"] = 768
 	created_with = []
 
-	def create_llm(candidate, temperature, max_tokens, structured=True):
+	def create_llm(candidate, temperature, timeout, max_tokens):
 		created_with.append(max_tokens)
 		return FakeLLM([
 			AgentReport(status="complete", decision="approve", summary="Token cap respected.")
@@ -382,7 +383,7 @@ def test_local_qwen3_uses_higher_completion_limit(monkeypatch):
 	settings["max_tokens"] = 1024
 	created_with = []
 
-	def create_llm(candidate, temperature, max_tokens, structured=True):
+	def create_llm(candidate, temperature, timeout, max_tokens):
 		created_with.append(max_tokens)
 		return FakeLLM([
 			AgentReport(status="complete", decision="approve", summary="Qwen output fits.")
@@ -563,7 +564,7 @@ def test_run_crew_survives_all_llm_calls_failing(monkeypatch, tmp_path, capsys):
 	)
 
 	assert result["risk_approved"] is True
-	assert adapter_timeouts == [{"connect_timeout": None, "client_session_timeout_seconds": None}]
+	assert adapter_timeouts == [{"connect_timeout": 120, "client_session_timeout_seconds": 120.0}]
 	assert "never-log-this-key" not in capsys.readouterr().out
 	assert execution_contexts[0]["risk_approved"] is True
 	assert calls.count(("validate_portfolio", {

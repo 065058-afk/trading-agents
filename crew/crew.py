@@ -49,6 +49,7 @@ LOGGER = logging.getLogger("trading_crew")
 GROQ_TOKENS_PER_MINUTE = 8_000
 LLM_MAX_TOKENS = 1_024
 QWEN3_MAX_TOKENS = 2_048
+MCP_TOOL_TIMEOUT_SECONDS = 120
 
 
 @dataclass(frozen=True)
@@ -100,7 +101,7 @@ class TokenPerMinuteLimiter:
 		assert self.state_path is not None
 		self.state_path.parent.mkdir(parents=True, exist_ok=True)
 		while True:
-			connection = sqlite3.connect(self.state_path, timeout=float("inf"))
+			connection = sqlite3.connect(self.state_path, timeout=60.0)
 			try:
 				self._initialize_shared(connection)
 				connection.commit()
@@ -129,7 +130,7 @@ class TokenPerMinuteLimiter:
 	def _block_shared(self, seconds: float) -> None:
 		assert self.state_path is not None
 		self.state_path.parent.mkdir(parents=True, exist_ok=True)
-		connection = sqlite3.connect(self.state_path, timeout=float("inf"))
+		connection = sqlite3.connect(self.state_path, timeout=60.0)
 		try:
 			self._initialize_shared(connection)
 			connection.commit()
@@ -181,7 +182,7 @@ def _model_available(provider: str, model: str, base_url: str, api_key: str | No
 		url = probe_base + "/api/tags"
 		headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 	try:
-		response = requests.get(url, headers=headers)
+		response = requests.get(url, headers=headers, timeout=4)
 		if not response.ok:
 			return False
 		payload = response.json()
@@ -230,6 +231,7 @@ def select_provider(config: Mapping[str, Any]) -> ProviderSelection:
 def _create_llm(
 	selection: ProviderSelection,
 	temperature: float,
+	timeout: int,
 	max_tokens: int = LLM_MAX_TOKENS,
 	structured: bool = True,
 ) -> LLM:
@@ -245,7 +247,7 @@ def _create_llm(
 			api_key=selection.api_key,
 			base_url=base_url,
 			temperature=temperature,
-			timeout=None,
+			timeout=timeout,
 			max_tokens=max_tokens,
 			**options,
 		)
@@ -255,7 +257,7 @@ def _create_llm(
 		model=f"ollama_chat/{selection.model}",
 		base_url=selection.base_url,
 		temperature=temperature,
-		timeout=None,
+		timeout=timeout,
 		max_tokens=max_tokens,
 		**options,
 	)
@@ -371,6 +373,7 @@ def _call_agent_report(
 				llm = _create_llm(
 					candidate,
 					float(settings.get("temperature", 0.1)),
+					int(settings.get("timeout_seconds", 30)),
 					max_tokens,
 				)
 				llm_cache[key] = llm
@@ -392,6 +395,7 @@ def _call_agent_report(
 						plain_llm = _create_llm(
 							candidate,
 							float(settings.get("temperature", 0.1)),
+							int(settings.get("timeout_seconds", 30)),
 							max_tokens,
 							False,
 						)
@@ -439,7 +443,8 @@ def _call_tool(tool_map: Mapping[str, Any], name: str, **arguments: Any) -> Any:
 def _poll_component_job(
 	tool_map: Mapping[str, Any], poll_tool: str, job_id: str
 ) -> dict[str, float]:
-	while True:
+	deadline = time.monotonic() + MCP_TOOL_TIMEOUT_SECONDS
+	while time.monotonic() < deadline:
 		result = _call_tool(tool_map, poll_tool, job_id=job_id)
 		if not isinstance(result, dict):
 			raise RuntimeError(f"{poll_tool} returned an invalid job result")
@@ -450,6 +455,7 @@ def _poll_component_job(
 		if result.get("status") != "running":
 			raise RuntimeError(f"{poll_tool} returned an unexpected job status")
 		time.sleep(0.25)
+	raise TimeoutError(f"{poll_tool} exceeded the {MCP_TOOL_TIMEOUT_SECONDS}s cycle deadline")
 
 
 
@@ -823,6 +829,7 @@ def run_crew(
 	config_override: Mapping[str, Any] | None = None,
 	credential_override: Mapping[str, str] | None = None,
 	cycle_event_callback: Callable[[str, Mapping[str, Any]], None] | None = None,
+	mcp_timeout_seconds: int = MCP_TOOL_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
 	student = student.upper()
 	if mode not in {"dry", "paper"}:
@@ -877,11 +884,12 @@ def run_crew(
 		env=server_env,
 	)
 	cycle_id = uuid.uuid4().hex
+	mcp_timeout_seconds = max(MCP_TOOL_TIMEOUT_SECONDS, int(mcp_timeout_seconds))
 	with MCPAdapt(
 		server_params,
 		CrewAIToolAdapter(),
-		connect_timeout=None,
-		client_session_timeout_seconds=None,
+		connect_timeout=mcp_timeout_seconds,
+		client_session_timeout_seconds=float(mcp_timeout_seconds),
 	) as tool_collection:
 		tool_map = {tool.name: tool for tool in tool_collection}
 		if cycle_event_callback is not None:
