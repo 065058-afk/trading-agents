@@ -19,6 +19,7 @@ from crew.crew import (
 	_short_llm_error,
 	_read_config,
 	_scale_target_weights,
+	_validation_symbols,
 	select_provider,
 	_zero_news_scores,
 )
@@ -590,6 +591,17 @@ def test_target_weight_scaling_enforces_total_exposure_cap():
 
 	assert sum(weights.values()) == pytest.approx(0.9)
 	assert sum(breaker_weights.values()) == pytest.approx(0.45)
+
+
+def test_validation_basket_only_reduces_student_c():
+	from crew.crew import _read_config
+
+	for student, expected_count in (("A", 15), ("B", 15), ("C", 13)):
+		config = _read_config(student)
+		symbols = [*config["high_beta"], *config["diversified"]]
+		selected = _validation_symbols(config, symbols)
+		assert len(selected) == expected_count
+		assert len(set(selected) & set(config["high_beta"])) / len(selected) >= 0.30
 
 
 def test_dry_blend_uses_local_combiner():

@@ -138,6 +138,20 @@ def test_blend_scores_rejects_incomplete_cycle_cache(monkeypatch, tmp_path):
 		server.blend_scores("A", requested, cycle_id="incomplete")
 
 
+def test_production_ml_job_skips_walk_forward_folds(monkeypatch):
+	calls = []
+
+	def fake_signal_ml(symbols, *, walk_forward):
+		calls.append((symbols, walk_forward))
+		return {symbol: 0.0 for symbol in symbols}
+
+	monkeypatch.setattr(server.signal_engine, "signal_ml", fake_signal_ml)
+
+	server._compute_background_component("ml", "A", ["AAA"], dry_run=False)
+
+	assert calls == [(["AAA"], False)]
+
+
 def test_earnings_guard_symbols_get_no_weight():
 	config = server._config("A")
 	symbols = [*config["high_beta"], *config["diversified"]]

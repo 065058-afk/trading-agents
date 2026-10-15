@@ -773,6 +773,18 @@ def _zero_news_scores(
 	)
 
 
+def _validation_symbols(config: Mapping[str, Any], symbols: list[str]) -> list[str]:
+	high_beta = [str(symbol).upper() for symbol in config["high_beta"]]
+	diversified = [str(symbol).upper() for symbol in config["diversified"]]
+	if len(high_beta) / max(len(symbols), 1) >= 0.30:
+		return symbols
+	max_count = min(15, int(len(high_beta) / 0.30))
+	diversified_count = max_count - len(high_beta)
+	if len(high_beta) + diversified_count < 10 or diversified_count < 0:
+		raise ValueError("Student configuration cannot form a valid 10-15 stock test basket")
+	return [*high_beta, *diversified[:diversified_count]]
+
+
 def _append_unavailable(path: Path, reason: str) -> None:
 	with path.open("a", encoding="utf-8") as report_file:
 		report_file.write(f"\nLLM commentary unavailable: {reason}\n")
@@ -828,6 +840,7 @@ def run_crew(
 		raise PermissionError("Paper execution requires TRADING_ENABLED=true")
 	config = dict(config_override) if config_override is not None else _read_config(student)
 	symbols = list(dict.fromkeys([*config["high_beta"], *config["diversified"]]))
+	blend_symbols = _validation_symbols(config, symbols)
 	now = datetime.now()
 	run_dir = LOG_ROOT / student / now.strftime("%Y%m%d_%H%M%S")
 	run_dir.mkdir(parents=True, exist_ok=True)
@@ -930,7 +943,7 @@ def run_crew(
 			tool_map,
 			"blend_scores",
 			student=student,
-			symbols=symbols,
+			symbols=blend_symbols,
 			dry_run=(mode == "dry"),
 			cycle_id=cycle_id,
 		)
@@ -961,7 +974,7 @@ def run_crew(
 		)
 		if news_error:
 			llm_failures.append(news_error)
-			blend = _zero_news_scores(student, symbols, blend, config)
+			blend = _zero_news_scores(student, blend_symbols, blend, config)
 			scores = blend.get("signal_scores", {})
 			if not isinstance(scores, Mapping):
 				scores = {}

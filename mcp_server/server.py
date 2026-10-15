@@ -115,7 +115,7 @@ def _compute_background_component(
 					persist=False,
 					walk_forward=False,
 				)
-			return signal_engine.signal_ml(symbols)
+			return signal_engine.signal_ml(symbols, walk_forward=False)
 		if name == "news":
 			if dry_run:
 				return {
