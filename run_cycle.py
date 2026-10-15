@@ -20,7 +20,6 @@ MAX_ORDER_NOTIONAL_USD = 10_000.0
 MAX_TOTAL_EXPOSURE = 1.0
 MAX_ORDERS_PER_DAY = 10
 MAX_LIVE_RUNS_PER_DAY = 2
-MCP_TOOL_TIMEOUT_SECONDS = 120
 EASTERN = ZoneInfo("America/New_York")
 
 
@@ -382,7 +381,6 @@ def run_cycle(
 	credential_override: Mapping[str, str] | None = None,
 	approval_handler: Callable[[dict[str, Any]], Mapping[str, Any]] | None = None,
 	event_callback: Callable[[str, Mapping[str, Any]], None] | None = None,
-	mcp_timeout_seconds: int = MCP_TOOL_TIMEOUT_SECONDS,
 ) -> int:
 	student = student.upper()
 	try:
@@ -491,7 +489,6 @@ def run_cycle(
 			"dry" if dry_run else "paper",
 			config_override=config,
 			credential_override=credential_override,
-			mcp_timeout_seconds=max(MCP_TOOL_TIMEOUT_SECONDS, int(mcp_timeout_seconds)),
 			target_scale=target_scale,
 			max_total_exposure=MAX_TOTAL_EXPOSURE,
 			allow_reduced_exposure=breaker_active,

@@ -162,7 +162,7 @@ def test_trading_enabled_false_forces_live_request_to_dry(monkeypatch, tmp_path)
 
 	assert result == 0
 	assert crew_calls[0][1] == "dry"
-	assert crew_calls[0][2]["mcp_timeout_seconds"] >= 120
+	assert "mcp_timeout_seconds" not in crew_calls[0][2]
 	placements = [arguments for name, arguments in calls if name == "place_orders"]
 	assert placements
 	assert all(arguments["dry_run"] for arguments in placements)

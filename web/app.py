@@ -20,8 +20,6 @@ from crew.crew import CONFIG_DIR, LOG_ROOT, ROOT, _read_config
 from run_cycle import run_cycle
 
 SESSION_COOKIE = "trading_session"
-SESSION_TTL_SECONDS = 12 * 60 * 60
-APPROVAL_TIMEOUT_SECONDS = 30 * 60
 SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9.-]*$")
 SIGNALS = ("trend", "rotation", "breakout", "dip", "ml", "news")
 PROVIDERS = ("ollama_local", "ollama_cloud", "groq")
@@ -127,7 +125,6 @@ class BrowserSession:
 	session_id: str
 	csrf_token: str
 	created_at: float = field(default_factory=time.time)
-	last_seen: float = field(default_factory=time.time)
 	credentials: dict[str, str] = field(default_factory=dict, repr=False)
 	jobs: dict[str, RunJob] = field(default_factory=dict, repr=False)
 
@@ -138,12 +135,7 @@ app = FastAPI(title="Trading Cycle Console", docs_url=None, redoc_url=None)
 
 
 def _session(request: Request, response: Response) -> BrowserSession:
-	now = time.time()
 	with _sessions_lock:
-		for key, value in list(_sessions.items()):
-			if now - value.last_seen > SESSION_TTL_SECONDS:
-				value.credentials.clear()
-				del _sessions[key]
 		token = request.cookies.get(SESSION_COOKIE, "")
 		current = _sessions.get(token)
 		if current is None:
@@ -156,10 +148,8 @@ def _session(request: Request, response: Response) -> BrowserSession:
 				httponly=True,
 				secure=request.url.scheme == "https",
 				samesite="strict",
-				max_age=SESSION_TTL_SECONDS,
 				path="/",
 			)
-		current.last_seen = now
 		return current
 
 
@@ -479,14 +469,8 @@ def _approval_handler(job: RunJob):
 			job.stage = "Review proposed orders"
 			job.updated_at = time.time()
 			job.condition.notify_all()
-			deadline = time.monotonic() + APPROVAL_TIMEOUT_SECONDS
 			while job.approval_decision is None:
-				remaining = deadline - time.monotonic()
-				if remaining <= 0:
-					job.approval_decision = {"action": "reject"}
-					job.error = "Approval timed out; no orders were submitted."
-					break
-				job.condition.wait(remaining)
+				job.condition.wait()
 			decision = job.approval_decision
 			job.approval_decision = None
 			job.status = "running"

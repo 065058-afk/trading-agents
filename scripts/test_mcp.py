@@ -7,7 +7,6 @@ import asyncio
 import json
 import os
 import sys
-from datetime import timedelta
 from pathlib import Path
 from typing import Any
 import uuid
@@ -18,7 +17,6 @@ from mcp.client.stdio import stdio_client
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-MCP_TOOL_TIMEOUT_SECONDS = 120
 
 
 def _payload(result: Any) -> Any:
@@ -135,7 +133,6 @@ async def _run(student: str) -> None:
 		async with ClientSession(
 			read_stream,
 			write_stream,
-			read_timeout_seconds=timedelta(seconds=MCP_TOOL_TIMEOUT_SECONDS),
 		) as session:
 			await session.initialize()
 			listed = await session.list_tools()
@@ -150,10 +147,7 @@ async def _run(student: str) -> None:
 				last_error = ""
 				for attempt in (1, 2):
 					try:
-						result = await asyncio.wait_for(
-							session.call_tool(name, arguments=arguments),
-							timeout=MCP_TOOL_TIMEOUT_SECONDS,
-						)
+						result = await session.call_tool(name, arguments=arguments)
 						if result.isError:
 							messages = [getattr(item, "text", "") for item in result.content]
 							last_error = _safe_error(" ".join(text for text in messages if text) or "unspecified MCP error")
@@ -188,8 +182,7 @@ async def _run(student: str) -> None:
 			async def poll_job(job: Any, tool_name: str) -> Any:
 				if not isinstance(job, dict) or not isinstance(job.get("job_id"), str):
 					raise RuntimeError(f"{tool_name} did not return a job id")
-				deadline = asyncio.get_running_loop().time() + MCP_TOOL_TIMEOUT_SECONDS
-				while asyncio.get_running_loop().time() < deadline:
+				while True:
 					result = await call(tool_name, {"job_id": job["job_id"]})
 					if isinstance(result, dict) and result.get("status") == "completed":
 						return result
@@ -198,7 +191,6 @@ async def _run(student: str) -> None:
 					if not isinstance(result, dict) or result.get("status") != "running":
 						raise RuntimeError(f"{tool_name} returned an invalid job status")
 					await asyncio.sleep(0.25)
-				raise TimeoutError(f"{tool_name} exceeded the {MCP_TOOL_TIMEOUT_SECONDS}s deadline")
 
 			await poll_job(ml_job, "get_signal_ml_result")
 			await poll_job(news_job, "get_signal_news_tilt_result")
