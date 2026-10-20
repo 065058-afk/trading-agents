@@ -217,41 +217,12 @@ def test_live_after_dry_runs(monkeypatch, tmp_path):
 	assert updated_state["runs"]["2026-10-13"]["mode"] == "live"
 
 
-def test_second_live_run_is_allowed_and_recorded(monkeypatch, tmp_path):
+def test_live_after_live_is_skipped(monkeypatch, tmp_path):
 	monkeypatch.setenv("TRADING_ENABLED", "true")
 	_, _, crew_calls = install_cycle_fakes(monkeypatch, tmp_path)
-	state_path = _write_cycle_state(
-		tmp_path,
-		{"peak_equity": 100_000.0, "runs": {"2026-10-13": {"status": "completed", "mode": "live"}}},
-	)
-
-	assert run_cycle.run_cycle("A", "live") == 0
-
-	assert len(crew_calls) == 1
-	updated = json.loads(state_path.read_text(encoding="utf-8"))
-	assert updated["runs"]["2026-10-13"]["live_run_count"] == 2
-	assert len(updated["runs"]["2026-10-13"]["cycles"]) == 2
-
-
-def test_third_live_run_is_skipped(monkeypatch, tmp_path):
-	monkeypatch.setenv("TRADING_ENABLED", "true")
-	_, _, crew_calls = install_cycle_fakes(monkeypatch, tmp_path)
-	completed = [
-		{"status": "completed", "mode": "live", "order_count": 0},
-		{"status": "completed", "mode": "live", "order_count": 1},
-	]
 	_write_cycle_state(
 		tmp_path,
-		{
-			"peak_equity": 100_000.0,
-			"runs": {
-				"2026-10-13": {
-					"status": "completed",
-					"mode": "live",
-					"cycles": completed,
-				},
-			},
-		},
+		{"peak_equity": 100_000.0, "runs": {"2026-10-13": {"status": "completed", "mode": "live"}}},
 	)
 
 	assert run_cycle.run_cycle("A", "live") == 0
