@@ -26,6 +26,19 @@
       "mode": "live",
       "order_count": 0,
       "status": "completed"
+    },
+    "2026-10-20": {
+      "daily_order_cap": {
+        "applied": "expanded",
+        "held_target_positions": 0,
+        "limit": 20,
+        "target_positions": 15
+      },
+      "drawdown_breaker": false,
+      "equity": 100000.0,
+      "mode": "live",
+      "order_count": 14,
+      "status": "completed"
     }
   }
 }
