@@ -19,7 +19,6 @@ from crew.crew import LOG_ROOT, ROOT, _call_tool, _read_config, run_crew
 MAX_ORDER_NOTIONAL_USD = 10_000.0
 MAX_TOTAL_EXPOSURE = 1.0
 MAX_ORDERS_PER_DAY = 10
-MAX_LIVE_RUNS_PER_DAY = 2
 MCP_TOOL_TIMEOUT_SECONDS = 120
 EASTERN = ZoneInfo("America/New_York")
 
@@ -30,23 +29,6 @@ def _today() -> str:
 
 def _state_path(student: str) -> Path:
 	return LOG_ROOT / student / "state.json"
-
-
-def _completed_live_runs(record: Any) -> list[dict[str, Any]]:
-	if not isinstance(record, Mapping):
-		return []
-	cycles = record.get("cycles")
-	if isinstance(cycles, list):
-		return [
-			dict(cycle)
-			for cycle in cycles
-			if isinstance(cycle, Mapping)
-			and cycle.get("status") == "completed"
-			and cycle.get("mode") == "live"
-		]
-	if record.get("status") == "completed" and record.get("mode") == "live":
-		return [dict(record)]
-	return []
 
 
 def _safe_error_message(error: Exception, credentials: Mapping[str, str] | None = None) -> str:
@@ -454,12 +436,12 @@ def run_cycle(
 		state_path = _state_path(student)
 		state = _load_state(state_path)
 		recorded_run = state["runs"].get(run_date, {})
-		completed_live_runs = _completed_live_runs(recorded_run)
-		if not dry_run and len(completed_live_runs) >= MAX_LIVE_RUNS_PER_DAY:
-			reason = (
-				f"Student {student} already completed {len(completed_live_runs)} live runs for "
-				f"{run_date} (daily maximum {MAX_LIVE_RUNS_PER_DAY}); skipping."
-			)
+		if (
+			not dry_run
+			and recorded_run.get("status") == "completed"
+			and recorded_run.get("mode") == "live"
+		):
+			reason = f"A run for student {student} is already recorded for {run_date}; skipping."
 			if event_callback is not None:
 				if client is None:
 					try:
@@ -508,19 +490,13 @@ def run_cycle(
 		)
 		if not dry_run:
 			state["peak_equity"] = max(peak_equity, equity)
-			completed_live_runs.append({
+			state["runs"][run_date] = {
 				"status": "completed",
 				"mode": "live",
-				"run_number": len(completed_live_runs) + 1,
 				"equity": equity,
 				"drawdown_breaker": breaker_active,
 				"order_count": int(crew_result.get("execution", {}).get("order_count", 0)),
 				"daily_order_cap": crew_result.get("execution", {}).get("daily_order_cap"),
-			})
-			state["runs"][run_date] = {
-				**completed_live_runs[-1],
-				"live_run_count": len(completed_live_runs),
-				"cycles": completed_live_runs,
 			}
 			_write_state(state_path, state)
 		if event_callback is not None:

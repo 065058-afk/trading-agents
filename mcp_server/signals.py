@@ -6,14 +6,9 @@ import json
 import logging
 import math
 import os
-import warnings
-from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
-from functools import partial
 from pathlib import Path
 from typing import Any, Mapping, Sequence
-
-warnings.filterwarnings("ignore", category=Warning, module=r"^(numba|pandas_ta)(\.|$)")
 
 import numpy as np
 import pandas as pd
@@ -58,8 +53,6 @@ STRONG_NEGATIVE_EVENTS = {
 	"accounting_irregularity",
 	"restatement",
 }
-NEWS_REQUEST_TIMEOUT_SECONDS = 15
-FINNHUB_NEWS_WORKERS = 5
 LOGGER = logging.getLogger(__name__)
 
 
@@ -533,51 +526,37 @@ def _fetch_news_headlines(symbols: Sequence[str], student: str) -> dict[str, lis
 	from alpaca.data.requests import NewsRequest
 
 	start = datetime.now(timezone.utc) - timedelta(days=3)
-	news_client = NewsClient(alpaca_key, alpaca_secret)
-	news_client._session.request = partial(
-		news_client._session.request,
-		timeout=NEWS_REQUEST_TIMEOUT_SECONDS,
-	)
-	response = news_client.get_news(
+	response = NewsClient(alpaca_key, alpaca_secret).get_news(
 		NewsRequest(symbols=",".join(symbols), start=start, sort="desc", limit=100, exclude_contentless=True)
 	)
 	alpaca_items = _alpaca_news_items(response)
 	combined = {symbol: [] for symbol in symbols}
 	for item in alpaca_items or []:
-		headline = str(item.get("headline", "") if isinstance(item, Mapping) else getattr(item, "headline", "") or "").strip()
-		item_symbols = item.get("symbols", []) if isinstance(item, Mapping) else getattr(item, "symbols", [])
-		for symbol in item_symbols or []:
+		headline = str(getattr(item, "headline", "") or "").strip()
+		for symbol in getattr(item, "symbols", []) or []:
 			if symbol in combined and headline:
 				combined[symbol].append(headline)
 
 	date_from = start.date().isoformat()
 	date_to = datetime.now(timezone.utc).date().isoformat()
-	def fetch_finnhub(symbol: str) -> tuple[str, list[str], bool]:
+	for symbol in symbols:
 		result = requests.get(
 			f"{FINNHUB_URL}/company-news",
 			headers={"X-Finnhub-Token": finnhub_key},
 			params={"symbol": symbol, "from": date_from, "to": date_to},
-			timeout=NEWS_REQUEST_TIMEOUT_SECONDS,
+			timeout=15,
 		)
 		try:
 			_check_finnhub_response(result)
 		except FinnhubAuthenticationError:
-			return symbol, [], True
-		headlines = [
-			str(item.get("headline", "")).strip()
-			for item in result.json()
-			if str(item.get("headline", "")).strip()
-		]
-		return symbol, headlines, False
-
-	with ThreadPoolExecutor(max_workers=FINNHUB_NEWS_WORKERS) as executor:
-		for symbol, headlines, auth_rejected in executor.map(fetch_finnhub, symbols):
-			if auth_rejected:
-				LOGGER.warning(
-					"Finnhub rejected FINNHUB_API_KEY; continuing with Alpaca headlines only"
-				)
-				break
-			combined[symbol].extend(headlines)
+			LOGGER.warning(
+				"Finnhub rejected FINNHUB_API_KEY; continuing with Alpaca headlines only"
+			)
+			break
+		for item in result.json():
+			headline = str(item.get("headline", "")).strip()
+			if headline:
+				combined[symbol].append(headline)
 	return {symbol: list(dict.fromkeys(headlines))[:20] for symbol, headlines in combined.items()}
 
 
