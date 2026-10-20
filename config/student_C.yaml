@@ -1,7 +1,7 @@
 student: C
 capital: 100000
-high_beta: [AMD, TER, DAL, FCX]
-diversified: [CSCO, MA, MRK, WMT, COP, SO, UNP, AMZN, LIN, O, TMO]
+high_beta: [AMD, TER, DAL, FCX, CCL]
+diversified: [CSCO, MA, MRK, WMT, COP, SO, UNP, AMZN, LIN, O]
 high_beta_share_base: 0.45
 high_beta_share_range: [0.35, 0.60]
 max_position_pct_high_beta: 0.15
