@@ -110,6 +110,43 @@ def test_dry_blend_retrains_ml_without_persisting_a_model(monkeypatch):
 	assert calls == [(requested, set(requested), False, False)]
 
 
+def test_pm_signal_requests_saved_ml_model(monkeypatch):
+	monkeypatch.delenv("MCP_DRY_RUN", raising=False)
+	monkeypatch.setenv("MCP_SLOT", "pm")
+	calls = []
+
+	def fake_signal_ml(symbols, **kwargs):
+		calls.append(kwargs)
+		return {symbol: 0.0 for symbol in symbols}
+
+	monkeypatch.setattr(server.signal_engine, "signal_ml", fake_signal_ml)
+
+	assert server._signal_call("signal_ml", ["AAPL"]) == {"AAPL": 0.0}
+	assert calls == [{"as_of": None, "persist": True, "reuse_saved_model": True}]
+
+
+def test_pm_dry_blend_fallback_reuses_saved_ml_model(monkeypatch):
+	monkeypatch.setenv("MCP_DRY_RUN", "1")
+	monkeypatch.setenv("MCP_SLOT", "pm")
+	monkeypatch.setattr(server, "_SIGNAL_SCORE_CACHE", {})
+	config = server._config("A")
+	requested = [*config["high_beta"], *config["diversified"]]
+	calls = []
+
+	def fake_signal_ml(symbols, **kwargs):
+		calls.append(kwargs)
+		return {symbol: 0.0 for symbol in symbols}
+
+	monkeypatch.setattr(server.signal_engine, "signal_ml", fake_signal_ml)
+	server.blend_scores("A", requested)
+
+	assert len(calls) == 1
+	assert set(calls[0]["history"]) == set(requested)
+	assert calls[0]["persist"] is False
+	assert calls[0]["walk_forward"] is False
+	assert calls[0]["reuse_saved_model"] is True
+
+
 def test_blend_scores_reuses_component_signals_from_same_cycle(monkeypatch):
 	monkeypatch.setenv("MCP_DRY_RUN", "1")
 	monkeypatch.setattr(server, "_SIGNAL_SCORE_CACHE", {})

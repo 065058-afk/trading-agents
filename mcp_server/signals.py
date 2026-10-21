@@ -446,8 +446,9 @@ def signal_ml(
 	history: Mapping[str, pd.DataFrame] | None = None,
 	persist: bool = True,
 	walk_forward: bool = True,
+	reuse_saved_model: bool = False,
 ) -> dict[str, float]:
-	"""Train a seeded LightGBM walk-forward model on 14 causal features and predict."""
+	"""Train or reuse a saved LightGBM model to score the latest causal features."""
 	from lightgbm import LGBMRegressor
 	import joblib
 
@@ -461,51 +462,68 @@ def signal_ml(
 		if frame is None or len(frame) < 80:
 			continue
 		features = _ml_features(frame)
-		target = frame["close"].astype(float).shift(-GAP) / frame["close"].astype(float) - 1.0
-		block = features.copy()
-		block["target"] = target
-		block["symbol"] = symbol
-		block["session"] = block.index
-		blocks.append(block.replace([np.inf, -np.inf], np.nan))
+		if not reuse_saved_model:
+			target = frame["close"].astype(float).shift(-GAP) / frame["close"].astype(float) - 1.0
+			block = features.copy()
+			block["target"] = target
+			block["symbol"] = symbol
+			block["session"] = block.index
+			blocks.append(block.replace([np.inf, -np.inf], np.nan))
 		current_row = features.dropna(subset=list(FEATURE_COLUMNS)).tail(1)
 		if not current_row.empty:
 			current_features[symbol] = current_row.iloc[-1]
-	if not blocks or not current_features:
+	if not current_features:
 		return _zero_scores(requested)
-	panel = pd.concat(blocks, ignore_index=True)
-	panel = panel.dropna(subset=[*FEATURE_COLUMNS, "target"])
-	if panel.empty:
-		return _zero_scores(requested)
-	metrics, sign = _walk_forward_folds(panel) if walk_forward else ([], 1)
-	for metric in metrics:
-		if metric["ic"] is not None:
-			validation_scale_values.append(float(metric["ic"]))
-	train = panel.loc[:, [*FEATURE_COLUMNS, "target"]]
-	if len(train) < 60:
-		return _zero_scores(requested)
-	model = LGBMRegressor(
-		objective="regression",
-		n_estimators=60,
-		learning_rate=0.04,
-		num_leaves=7,
-		max_depth=3,
-		min_child_samples=10,
-		reg_lambda=1.0,
-		random_state=RANDOM_SEED,
-		n_jobs=1,
-		verbosity=-1,
-	)
-	model.fit(train.loc[:, FEATURE_COLUMNS], train["target"])
-	if persist:
-		MODEL_DIR.mkdir(parents=True, exist_ok=True)
-		version = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-		model_path = MODEL_DIR / f"lightgbm_signal_{version}.joblib"
-		joblib.dump({"model": model, "features": list(FEATURE_COLUMNS), "signal_sign": sign}, model_path)
-		_record_ml_run(metrics, sign, model_path)
-	all_targets = panel["target"].abs().to_numpy(dtype=float)
-	scale = float(np.nanmedian(all_targets)) if len(all_targets) else 0.02
-	if not np.isfinite(scale) or scale < 1e-4:
-		scale = 0.02
+	if reuse_saved_model:
+		model_paths = sorted(MODEL_DIR.glob("lightgbm_signal_*.joblib"))
+		if not model_paths:
+			return _zero_scores(requested)
+		try:
+			artifact = joblib.load(model_paths[-1])
+			if artifact.get("features") != list(FEATURE_COLUMNS):
+				return _zero_scores(requested)
+			model = artifact["model"]
+			sign = int(artifact.get("signal_sign", 1))
+			scale = float(artifact.get("scale", 0.02))
+		except (OSError, EOFError, ValueError, TypeError, AttributeError, KeyError):
+			return _zero_scores(requested)
+	else:
+		if not blocks:
+			return _zero_scores(requested)
+		panel = pd.concat(blocks, ignore_index=True)
+		panel = panel.dropna(subset=[*FEATURE_COLUMNS, "target"])
+		if panel.empty:
+			return _zero_scores(requested)
+		metrics, sign = _walk_forward_folds(panel) if walk_forward else ([], 1)
+		for metric in metrics:
+			if metric["ic"] is not None:
+				validation_scale_values.append(float(metric["ic"]))
+		train = panel.loc[:, [*FEATURE_COLUMNS, "target"]]
+		if len(train) < 60:
+			return _zero_scores(requested)
+		model = LGBMRegressor(
+			objective="regression",
+			n_estimators=60,
+			learning_rate=0.04,
+			num_leaves=7,
+			max_depth=3,
+			min_child_samples=10,
+			reg_lambda=1.0,
+			random_state=RANDOM_SEED,
+			n_jobs=1,
+			verbosity=-1,
+		)
+		model.fit(train.loc[:, FEATURE_COLUMNS], train["target"])
+		all_targets = panel["target"].abs().to_numpy(dtype=float)
+		scale = float(np.nanmedian(all_targets)) if len(all_targets) else 0.02
+		if not np.isfinite(scale) or scale < 1e-4:
+			scale = 0.02
+		if persist:
+			MODEL_DIR.mkdir(parents=True, exist_ok=True)
+			version = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+			model_path = MODEL_DIR / f"lightgbm_signal_{version}.joblib"
+			joblib.dump({"model": model, "features": list(FEATURE_COLUMNS), "signal_sign": sign, "scale": scale}, model_path)
+			_record_ml_run(metrics, sign, model_path)
 	scores = _zero_scores(requested)
 	for symbol, features in current_features.items():
 		prediction = float(model.predict(features.loc[list(FEATURE_COLUMNS)].to_frame().T)[0])

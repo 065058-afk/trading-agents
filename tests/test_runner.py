@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime
+import sys
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import run_cycle
 
@@ -206,15 +208,15 @@ def test_live_after_dry_runs(monkeypatch, tmp_path):
 	_, _, crew_calls = install_cycle_fakes(monkeypatch, tmp_path)
 	state_path = _write_cycle_state(
 		tmp_path,
-		{"peak_equity": 100_000.0, "runs": {"2026-10-13": {"status": "completed", "mode": "dry"}}},
+		{"peak_equity": 100_000.0, "runs": {"2026-10-13:am": {"status": "completed", "mode": "dry"}}},
 	)
 
 	assert run_cycle.run_cycle("A", "live") == 0
 
 	assert len(crew_calls) == 1
 	updated_state = json.loads(state_path.read_text(encoding="utf-8"))
-	assert updated_state["runs"]["2026-10-13"]["status"] == "completed"
-	assert updated_state["runs"]["2026-10-13"]["mode"] == "live"
+	assert updated_state["runs"]["2026-10-13:am"]["status"] == "completed"
+	assert updated_state["runs"]["2026-10-13:am"]["mode"] == "live"
 
 
 def test_live_after_live_is_skipped(monkeypatch, tmp_path):
@@ -222,7 +224,7 @@ def test_live_after_live_is_skipped(monkeypatch, tmp_path):
 	_, _, crew_calls = install_cycle_fakes(monkeypatch, tmp_path)
 	_write_cycle_state(
 		tmp_path,
-		{"peak_equity": 100_000.0, "runs": {"2026-10-13": {"status": "completed", "mode": "live"}}},
+		{"peak_equity": 100_000.0, "runs": {"2026-10-13:am": {"status": "completed", "mode": "live"}}},
 	)
 
 	assert run_cycle.run_cycle("A", "live") == 0
@@ -265,7 +267,7 @@ def test_drawdown_breaker_halves_targets_and_blocks_buys(monkeypatch, tmp_path):
 	assert [order["side"] for arguments in placements for order in arguments["orders"]] == ["sell"]
 	updated_state = json.loads(state_path.read_text(encoding="utf-8"))
 	assert updated_state["peak_equity"] == 100_000.0
-	assert updated_state["runs"]["2026-10-13"]["drawdown_breaker"] is True
+	assert updated_state["runs"]["2026-10-13:am"]["drawdown_breaker"] is True
 
 
 def test_order_caps_and_sell_first_submission(monkeypatch, tmp_path):
@@ -310,14 +312,14 @@ def test_order_caps_and_sell_first_submission(monkeypatch, tmp_path):
 	placements = [(name, args) for name, args in calls if name == "place_orders"]
 	assert len(placements) == 2
 	assert all(order["side"] == "sell" for order in placements[0][1]["orders"])
-	assert len(placements[1][1]["orders"]) == 19
+	assert len(placements[1][1]["orders"]) == 9
 	assert all(order["side"] == "buy" for order in placements[1][1]["orders"])
 	all_orders = [order for _, arguments in placements for order in arguments["orders"]]
-	assert len(all_orders) == 20
+	assert len(all_orders) == 10
 	assert all(order["qty"] * 50.0 <= run_cycle.MAX_ORDER_NOTIONAL_USD for order in all_orders)
 	assert len({order["client_order_id"] for order in all_orders}) == len(all_orders)
 	state = json.loads((tmp_path / "logs" / "A" / "state.json").read_text(encoding="utf-8"))
-	assert state["runs"]["2026-10-13"]["daily_order_cap"]["limit"] == 20
+	assert state["runs"]["2026-10-13:am"]["order_cap"]["limit"] == 10
 
 
 def test_execution_nets_symbols_and_caps_sells_to_available_long_quantity(monkeypatch, tmp_path):
@@ -340,11 +342,83 @@ def test_execution_nets_symbols_and_caps_sells_to_available_long_quantity(monkey
 		if name == "place_orders"
 		for order in arguments["orders"]
 	]
-	assert orders == [{"symbol": "MSFT", "side": "sell", "qty": 2.0, "client_order_id": "cycle-A-20261013-sell-MSFT"}]
+	assert orders == [{"symbol": "MSFT", "side": "sell", "qty": 2.0, "client_order_id": "cycle-A-20261013-am-sell-MSFT"}]
 
 
-def test_daily_order_cap_returns_normal_limit_at_half_target(monkeypatch):
-	targets = {"A", "B", "C", "D", "E", "F", "G", "H", "I", "J"}
-	positions = [{"symbol": symbol, "qty": 1.0, "side": "long"} for symbol in "ABCDE"]
+def test_order_cap_is_twenty_for_empty_account_and_ten_otherwise():
+	assert run_cycle._order_cap([]) == (20, "first_fill", 0)
+	assert run_cycle._order_cap([{"symbol": "AAPL", "qty": 1.0, "side": "long"}]) == (10, "normal", 1)
 
-	assert run_cycle._daily_order_cap(targets, positions) == (10, "normal", 5)
+
+def test_auto_slot_maps_et_windows_and_skips_midday():
+	eastern = ZoneInfo("America/New_York")
+	assert run_cycle._resolve_slot("auto", datetime(2026, 10, 21, 10, 0, tzinfo=eastern)) == "am"
+	assert run_cycle._resolve_slot("auto", datetime(2026, 10, 21, 15, 0, tzinfo=eastern)) == "pm"
+	assert run_cycle._resolve_slot("auto", datetime(2026, 10, 21, 12, 0, tzinfo=eastern)) is None
+
+
+def test_today_uses_new_york_date_at_utc_day_boundary():
+	utc = ZoneInfo("UTC")
+	assert run_cycle._today(datetime(2026, 10, 14, 2, 30, tzinfo=utc)) == "2026-10-13"
+
+
+def test_auto_cli_skips_without_running_cycle(monkeypatch, capsys):
+	class MiddayDateTime:
+		@staticmethod
+		def now(tz=None):
+			return datetime(2026, 10, 21, 12, 0, tzinfo=tz)
+
+	monkeypatch.setattr(run_cycle, "datetime", MiddayDateTime)
+	monkeypatch.setattr(sys, "argv", ["run_cycle.py", "--student", "A"])
+	monkeypatch.setattr(
+		run_cycle,
+		"run_cycle",
+		lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unscheduled cycle ran")),
+	)
+
+	assert run_cycle.main() == 0
+	assert capsys.readouterr().out.strip() == "Not a scheduled slot"
+
+
+def test_completed_am_does_not_block_pm(monkeypatch, tmp_path):
+	monkeypatch.setenv("TRADING_ENABLED", "true")
+	_, _, crew_calls = install_cycle_fakes(monkeypatch, tmp_path)
+	_write_cycle_state(
+		tmp_path,
+		{"peak_equity": 100_000.0, "runs": {"2026-10-13:am": {"status": "completed", "mode": "live"}}},
+	)
+
+	assert run_cycle.run_cycle("A", "live", slot="pm") == 0
+	assert len(crew_calls) == 1
+
+
+def test_completed_pm_is_skipped_on_second_pm(monkeypatch, tmp_path):
+	monkeypatch.setenv("TRADING_ENABLED", "true")
+	_, _, crew_calls = install_cycle_fakes(monkeypatch, tmp_path)
+	_write_cycle_state(
+		tmp_path,
+		{"peak_equity": 100_000.0, "runs": {"2026-10-13:pm": {"status": "completed", "mode": "live"}}},
+	)
+
+	assert run_cycle.run_cycle("A", "live", slot="pm") == 0
+	assert crew_calls == []
+
+
+def test_order_ids_differ_by_slot():
+	prices = {"AAPL": 100.0}
+	am = run_cycle._bounded_orders([{"symbol": "AAPL", "side": "buy", "qty": 1.0}], prices, "A", "2026-10-13", "am", 1)
+	pm = run_cycle._bounded_orders([{"symbol": "AAPL", "side": "buy", "qty": 1.0}], prices, "A", "2026-10-13", "pm", 1)
+	assert am[0]["client_order_id"] != pm[0]["client_order_id"]
+
+
+def test_pm_filters_small_rebalances_but_keeps_exit_orders(monkeypatch, tmp_path):
+	monkeypatch.setenv("TRADING_ENABLED", "true")
+	positions = [
+		{"symbol": "AAPL", "qty": 490.0, "qty_available": 490.0, "side": "long", "market_value": 49_000.0},
+		{"symbol": "MSFT", "qty": 500.0, "qty_available": 500.0, "side": "long", "market_value": 50_000.0},
+	]
+	_, calls, _ = install_cycle_fakes(monkeypatch, tmp_path, positions=positions)
+
+	assert run_cycle.run_cycle("A", "live", slot="pm") == 0
+	orders = [order for name, arguments in calls if name == "place_orders" for order in arguments["orders"]]
+	assert orders == [{"symbol": "MSFT", "side": "sell", "qty": 1.0, "client_order_id": "cycle-A-20261013-pm-sell-MSFT"}]
