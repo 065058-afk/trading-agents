@@ -2,10 +2,17 @@ from __future__ import annotations
 
 import json
 
+import joblib
+import lightgbm
 import numpy as np
 import pandas as pd
 
 from mcp_server import signals
+
+
+class SavedModel:
+    def predict(self, features):
+        return np.full(len(features), 0.01)
 
 
 def _market_frames(count: int = 340) -> dict[str, pd.DataFrame]:
@@ -99,6 +106,33 @@ def test_dry_ml_retrain_can_skip_walk_forward_evaluation(monkeypatch, tmp_path):
 
     _assert_valid_scores(scores, symbols)
     assert not (tmp_path / "models").exists()
+
+
+def test_pm_ml_reuses_saved_model_without_fitting(monkeypatch, tmp_path):
+    frames = _market_frames()
+    symbols = ["AAA", "BBB", "CCC"]
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    joblib.dump(
+        {"model": SavedModel(), "features": list(signals.FEATURE_COLUMNS), "signal_sign": 1, "scale": 0.02},
+        model_dir / "lightgbm_signal_20261013T000000000000Z.joblib",
+    )
+    monkeypatch.setattr(signals, "MODEL_DIR", model_dir)
+    monkeypatch.setattr(
+        signals,
+        "_ml_features",
+        lambda frame: pd.DataFrame(1.0, index=frame.index, columns=signals.FEATURE_COLUMNS),
+    )
+    monkeypatch.setattr(
+        lightgbm.LGBMRegressor,
+        "fit",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("PM retrained ML")),
+    )
+
+    scores = signals.signal_ml(symbols, history=frames, reuse_saved_model=True)
+
+    _assert_valid_scores(scores, symbols)
+    assert all(score > 0.0 for score in scores.values())
 
 
 def test_price_signals_and_ml_do_not_use_future_bars(monkeypatch, tmp_path):

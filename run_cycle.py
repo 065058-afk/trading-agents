@@ -7,7 +7,7 @@ import json
 import math
 import os
 import re
-from datetime import datetime
+from datetime import datetime, time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 from zoneinfo import ZoneInfo
@@ -18,13 +18,37 @@ from crew.crew import LOG_ROOT, ROOT, _call_tool, _read_config, run_crew
 
 MAX_ORDER_NOTIONAL_USD = 10_000.0
 MAX_TOTAL_EXPOSURE = 1.0
-MAX_ORDERS_PER_DAY = 10
+MAX_ORDERS_PER_RUN = 10
 MCP_TOOL_TIMEOUT_SECONDS = 120
 EASTERN = ZoneInfo("America/New_York")
+PM_REBALANCE_THRESHOLD = 0.02
 
 
-def _today() -> str:
-	return datetime.now(EASTERN).date().isoformat()
+def _today(now: datetime | None = None) -> str:
+	current = now or datetime.now(EASTERN)
+	if current.tzinfo is None:
+		current = current.replace(tzinfo=EASTERN)
+	else:
+		current = current.astimezone(EASTERN)
+	return current.date().isoformat()
+
+
+def _resolve_slot(slot: str, now: datetime | None = None) -> str | None:
+	if slot in {"am", "pm"}:
+		return slot
+	if slot != "auto":
+		raise ValueError("slot must be auto, am, or pm")
+	current = now or datetime.now(EASTERN)
+	if current.tzinfo is None:
+		current = current.replace(tzinfo=EASTERN)
+	else:
+		current = current.astimezone(EASTERN)
+	local_time = current.time().replace(tzinfo=None)
+	if time(9, 55) <= local_time <= time(10, 45):
+		return "am"
+	if time(14, 55) <= local_time <= time(15, 45):
+		return "pm"
+	return None
 
 
 def _state_path(student: str) -> Path:
@@ -146,17 +170,11 @@ def _long_quantity(position: Mapping[str, Any]) -> float:
 	return quantity
 
 
-def _daily_order_cap(target_symbols: set[str], positions: list[Mapping[str, Any]]) -> tuple[int, str, int]:
-	target_count = len(target_symbols)
-	held_symbols = {
-		str(position.get("symbol", "")).upper()
-		for position in positions
-		if _long_quantity(position) > 0.0
-	}
-	held_target_count = len(target_symbols & held_symbols)
-	if held_target_count == 0 or held_target_count < target_count * 0.5:
-		return max(20, target_count + 5), "expanded", held_target_count
-	return MAX_ORDERS_PER_DAY, "normal", held_target_count
+def _order_cap(positions: list[Mapping[str, Any]]) -> tuple[int, str, int]:
+	held_position_count = sum(abs(float(position.get("qty", 0.0) or 0.0)) > 0.0 for position in positions)
+	if held_position_count == 0:
+		return 20, "first_fill", held_position_count
+	return MAX_ORDERS_PER_RUN, "normal", held_position_count
 
 
 def _net_orders(
@@ -195,6 +213,7 @@ def _bounded_orders(
 	prices: Mapping[str, float],
 	student: str,
 	run_date: str,
+	slot: str,
 	remaining_slots: int,
 ) -> list[dict[str, Any]]:
 	bounded: list[dict[str, Any]] = []
@@ -218,7 +237,7 @@ def _bounded_orders(
 					"symbol": symbol,
 					"side": side,
 					"qty": quantity,
-					"client_order_id": f"cycle-{student}-{run_date.replace('-', '')}-{side}-{symbol}",
+					"client_order_id": f"cycle-{student}-{run_date.replace('-', '')}-{slot}-{side}-{symbol}",
 				}
 			)
 	return bounded
@@ -259,9 +278,10 @@ def _apply_approval_edit(
 def _execution_handler(
 	student: str,
 	run_date: str,
+	slot: str,
+	equity: float,
 	dry_run: bool,
 	breaker_active: bool,
-	target_symbols: set[str],
 	approval_handler: Callable[[dict[str, Any]], Mapping[str, Any]] | None = None,
 	event_callback: Callable[[str, Mapping[str, Any]], None] | None = None,
 ):
@@ -271,10 +291,10 @@ def _execution_handler(
 		account_positions = account.get("positions", []) if isinstance(account, Mapping) else []
 		if not isinstance(account_positions, list):
 			account_positions = []
-		daily_order_cap, cap_kind, held_target_count = _daily_order_cap(target_symbols, account_positions)
+		order_cap, cap_kind, held_position_count = _order_cap(account_positions)
 		print(
-			f"Daily order cap applied: {daily_order_cap} ({cap_kind}; "
-			f"{held_target_count}/{len(target_symbols)} target positions held)."
+			f"Per-run order cap applied: {order_cap} ({cap_kind}; "
+			f"{held_position_count} positions held)."
 		)
 		exits = _call_tool(tool_map, "check_exits", student=student, dry_run=dry_run)
 		exit_orders = exits.get("orders", []) if isinstance(exits, dict) else []
@@ -288,6 +308,19 @@ def _execution_handler(
 				dry_run=dry_run,
 			)
 		diff_orders = portfolio_diff.get("orders", []) if isinstance(portfolio_diff, dict) else []
+		if slot == "pm":
+			positions_by_symbol = {
+				str(position.get("symbol", "")).upper(): position
+				for position in account_positions
+			}
+			diff_orders = [
+				order
+				for order in diff_orders
+				if abs(
+					float(context["target_weights"].get(str(order.get("symbol", "")).upper(), 0.0))
+					- float(positions_by_symbol.get(str(order.get("symbol", "")).upper(), {}).get("market_value", 0.0) or 0.0) / equity
+				) > PM_REBALANCE_THRESHOLD
+			]
 		orders_to_net = list(diff_orders) + list(exit_orders)
 		if breaker_active or not context["risk_approved"]:
 			orders_to_net = [
@@ -298,10 +331,10 @@ def _execution_handler(
 		buys = [order for order in netted_orders if order["side"] == "buy"]
 		prices = context["latest_prices"]
 		bounded_sells = _bounded_orders(
-			sells, prices, student, run_date, daily_order_cap
+				sells, prices, student, run_date, slot, order_cap
 		)
 		bounded_buys = _bounded_orders(
-			buys, prices, student, run_date, daily_order_cap - len(bounded_sells)
+				buys, prices, student, run_date, slot, order_cap - len(bounded_sells)
 		)
 		proposed_orders = [*bounded_sells, *bounded_buys]
 		if event_callback is not None:
@@ -340,11 +373,10 @@ def _execution_handler(
 			"proposed_orders": proposed_orders,
 			"breaker_active": breaker_active,
 			"mode": "dry" if dry_run else "live",
-			"daily_order_cap": {
-				"limit": daily_order_cap,
+			"order_cap": {
+				"limit": order_cap,
 				"applied": cap_kind,
-				"held_target_positions": held_target_count,
-				"target_positions": len(target_symbols),
+				"held_positions": held_position_count,
 			},
 		}
 		result["account"] = account
@@ -359,6 +391,7 @@ def run_cycle(
 	student: str,
 	mode: str,
 	*,
+	slot: str = "am",
 	force_clock: bool = False,
 	config_override: Mapping[str, Any] | None = None,
 	credential_override: Mapping[str, str] | None = None,
@@ -372,6 +405,8 @@ def run_cycle(
 			raise ValueError("student must be A, B, or C")
 		if mode not in {"dry", "live"}:
 			raise ValueError("mode must be dry or live")
+		if slot not in {"am", "pm"}:
+			raise ValueError("slot must be am or pm")
 		if force_clock and mode != "dry":
 			raise ValueError("--force-clock is available only in dry mode")
 
@@ -435,13 +470,14 @@ def run_cycle(
 		run_date = _today()
 		state_path = _state_path(student)
 		state = _load_state(state_path)
-		recorded_run = state["runs"].get(run_date, {})
+		run_key = f"{run_date}:{slot}"
+		recorded_run = state["runs"].get(run_key, {})
 		if (
 			not dry_run
 			and recorded_run.get("status") == "completed"
 			and recorded_run.get("mode") == "live"
 		):
-			reason = f"A run for student {student} is already recorded for {run_date}; skipping."
+			reason = f"A {slot.upper()} run for student {student} is already recorded for {run_date}; skipping."
 			if event_callback is not None:
 				if client is None:
 					try:
@@ -451,7 +487,7 @@ def run_cycle(
 				account_snapshot = _alpaca_snapshot(client) if client is not None else None
 				event_callback(
 					"cycle_skipped",
-					{"reason": reason, "run_date": run_date, "account_snapshot": account_snapshot},
+					{"reason": reason, "run_date": run_date, "slot": slot, "account_snapshot": account_snapshot},
 				)
 			print(reason)
 			return 0
@@ -478,25 +514,29 @@ def run_cycle(
 			max_total_exposure=MAX_TOTAL_EXPOSURE,
 			allow_reduced_exposure=breaker_active,
 			cycle_event_callback=event_callback,
+			slot=slot,
 			execution_handler=_execution_handler(
 				student,
 				run_date,
+				slot,
+				equity,
 				dry_run,
 				breaker_active,
-				{str(symbol).upper() for symbol in [*config["high_beta"], *config["diversified"]]},
 				approval_handler,
 				event_callback,
 			),
 		)
 		if not dry_run:
 			state["peak_equity"] = max(peak_equity, equity)
-			state["runs"][run_date] = {
+			state["runs"][run_key] = {
 				"status": "completed",
 				"mode": "live",
+				"date": run_date,
+				"slot": slot,
 				"equity": equity,
 				"drawdown_breaker": breaker_active,
 				"order_count": int(crew_result.get("execution", {}).get("order_count", 0)),
-				"daily_order_cap": crew_result.get("execution", {}).get("daily_order_cap"),
+				"order_cap": crew_result.get("execution", {}).get("order_cap"),
 			}
 			_write_state(state_path, state)
 		if event_callback is not None:
@@ -518,9 +558,14 @@ def main() -> int:
 	parser = argparse.ArgumentParser(description="Run one guarded trading cycle.")
 	parser.add_argument("--student", required=True, choices=("A", "B", "C"))
 	parser.add_argument("--mode", choices=("dry", "live"), default="dry")
+	parser.add_argument("--slot", choices=("auto", "am", "pm"), default="auto")
 	parser.add_argument("--force-clock", action="store_true", help="Bypass the market clock in dry mode only.")
 	args = parser.parse_args()
-	return run_cycle(args.student, args.mode, force_clock=args.force_clock)
+	resolved_slot = _resolve_slot(args.slot)
+	if resolved_slot is None:
+		print("Not a scheduled slot")
+		return 0
+	return run_cycle(args.student, args.mode, slot=resolved_slot, force_clock=args.force_clock)
 
 
 if __name__ == "__main__":

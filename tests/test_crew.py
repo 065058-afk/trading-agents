@@ -17,6 +17,8 @@ from crew.crew import (
 	_retry_after_seconds,
 	_score_summary,
 	_shared_limiter_path,
+	_llm_settings_for_mode,
+	_provider_candidates,
 	_short_llm_error,
 	_read_config,
 	_scale_target_weights,
@@ -127,6 +129,17 @@ def test_student_configs_prefer_installed_local_free_model():
 		assert llm_config["provider_order"][0] == "ollama_local"
 		assert llm_config["providers"]["ollama_local"]["model"] == "qwen3:0.6b"
 		assert llm_config["max_tokens"] == 1024
+
+
+def test_dry_runs_only_select_and_fall_back_to_local_ollama():
+	settings = _read_config("A")["llm"]
+	dry_settings = _llm_settings_for_mode(settings, "dry")
+	selection = ProviderSelection("ollama_local", "qwen3:0.6b", "http://localhost:11434", None)
+
+	assert dry_settings["provider_order"] == ["ollama_local"]
+	assert set(dry_settings["providers"]) == {"ollama_local"}
+	assert [candidate.name for candidate in _provider_candidates(selection, dry_settings)] == ["ollama_local"]
+	assert _llm_settings_for_mode(settings, "paper")["provider_order"] == settings["provider_order"]
 
 
 def test_native_groq_llm_uses_model_id_verbatim():

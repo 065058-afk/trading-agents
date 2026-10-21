@@ -1,8 +1,10 @@
 name: trade
 on:
   schedule:
-    - cron: "0 14 * * 1-5"   # 10:00 ET in daylight time
-    - cron: "0 15 * * 1-5"   # 10:00 ET in standard time
+    - cron: "0 14 * * 1-5"   # run 1, 10:00 ET in daylight time = 7:30 pm IST
+    - cron: "0 15 * * 1-5"   # run 1, 10:00 ET in standard time = 8:30 pm IST
+    - cron: "0 19 * * 1-5"   # run 2, 15:00 ET in daylight time = 12:30 am IST
+    - cron: "0 20 * * 1-5"   # run 2, 15:00 ET in standard time = 1:30 am IST
   workflow_dispatch:
     inputs:
       mode:
@@ -12,6 +14,14 @@ on:
         description: "Bypass the market clock in dry mode"
         type: boolean
         default: false
+      slot:
+        description: "Trading slot"
+        type: choice
+        options:
+          - auto
+          - am
+          - pm
+        default: auto
 concurrency:
   group: trade
   cancel-in-progress: false
@@ -60,6 +70,7 @@ jobs:
           TRADING_ENABLED: ${{ vars.TRADING_ENABLED }}
           MODE: ${{ github.event.inputs.mode || 'live' }}
           FORCE_CLOCK: ${{ github.event.inputs.force_clock || 'false' }}
+          SLOT: ${{ github.event.inputs.slot || 'auto' }}
         run: |
           status=0
           force_clock_args=()
@@ -67,7 +78,7 @@ jobs:
             force_clock_args+=(--force-clock)
           fi
           for s in A B C; do
-            python run_cycle.py --student "$s" --mode "$MODE" "${force_clock_args[@]}" || status=1
+            python run_cycle.py --student "$s" --mode "$MODE" --slot "$SLOT" "${force_clock_args[@]}" || status=1
           done
           exit $status
       - name: Save logs, cache and models

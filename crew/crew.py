@@ -170,6 +170,22 @@ def _read_config(student: str) -> dict[str, Any]:
 	return config
 
 
+def _llm_settings_for_mode(settings: Mapping[str, Any], mode: str) -> dict[str, Any]:
+	if mode != "dry":
+		return dict(settings)
+	providers = settings.get("providers", {})
+	local_provider = providers.get("ollama_local") if isinstance(providers, Mapping) else None
+	if not isinstance(local_provider, Mapping):
+		local_provider = settings.get("ollama_local")
+	if not isinstance(local_provider, Mapping):
+		return {**settings, "provider_order": [], "providers": {}}
+	return {
+		**settings,
+		"provider_order": ["ollama_local"],
+		"providers": {"ollama_local": local_provider},
+	}
+
+
 def _model_available(provider: str, model: str, base_url: str, api_key: str | None) -> bool:
 	if provider == "groq":
 		url = base_url.rstrip("/") + "/models"
@@ -791,6 +807,7 @@ def run_crew(
 	student: str,
 	mode: str,
 	*,
+	slot: str = "am",
 	target_scale: float = 1.0,
 	max_total_exposure: float = 1.0,
 	allow_reduced_exposure: bool = False,
@@ -814,7 +831,7 @@ def run_crew(
 	run_dir.mkdir(parents=True, exist_ok=True)
 	stamp = now.strftime("%d%m%Y-%H-%M")
 
-	llm_config = config.get("llm", {})
+	llm_config = _llm_settings_for_mode(config.get("llm", {}), mode)
 	try:
 		selection: ProviderSelection | None = select_provider(llm_config)
 	except RuntimeError:
@@ -834,6 +851,7 @@ def run_crew(
 		print("LLM provider unavailable; using deterministic tool reports.")
 
 	server_env = os.environ.copy()
+	server_env["MCP_SLOT"] = slot
 	if config_override is not None:
 		server_env["MCP_STUDENT_CONFIG_JSON"] = json.dumps({student: config})
 	if credential_override is not None:

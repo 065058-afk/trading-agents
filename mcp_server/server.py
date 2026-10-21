@@ -154,7 +154,8 @@ def _market_frames(symbols: Sequence[str], *, dry_run: bool = False) -> dict[str
 def _signal_call(name: str, symbols: Sequence[str], as_of: str | None = None) -> dict[str, float]:
 	requested = _normalize_symbols(symbols)
 	is_dry = _dry_run()
-	if name == "signal_ml" and is_dry:
+	reuse_saved_model = name == "signal_ml" and os.environ.get("MCP_SLOT", "am").lower() == "pm"
+	if name == "signal_ml" and is_dry and not reuse_saved_model:
 		return {symbol: 0.0 for symbol in requested}
 	frames = _market_frames(requested, dry_run=True) if is_dry else None
 	function = getattr(signal_engine, name)
@@ -163,6 +164,8 @@ def _signal_call(name: str, symbols: Sequence[str], as_of: str | None = None) ->
 		kwargs["history"] = frames
 	if name == "signal_ml":
 		kwargs["persist"] = not is_dry
+		if reuse_saved_model:
+			kwargs["reuse_saved_model"] = True
 	return {symbol: float(score) for symbol, score in function(requested, **kwargs).items()}
 
 
@@ -479,12 +482,23 @@ def blend_scores(
 			for signal_index, name in enumerate(("trend", "rotation", "breakout", "dip", "ml", "news"))
 		}
 		cached_ml = _cached_signal("signal_ml", requested)
-		score_map["ml"] = cached_ml if cached_ml is not None else signal_engine.signal_ml(
-			requested,
-			history=_market_frames(requested, dry_run=True),
-			persist=False,
-			walk_forward=False,
-		)
+		if cached_ml is not None:
+			score_map["ml"] = cached_ml
+		elif os.environ.get("MCP_SLOT", "am").lower() == "pm":
+			score_map["ml"] = signal_engine.signal_ml(
+				requested,
+				history=_market_frames(requested, dry_run=True),
+				persist=False,
+				walk_forward=False,
+				reuse_saved_model=True,
+			)
+		else:
+			score_map["ml"] = signal_engine.signal_ml(
+				requested,
+				history=_market_frames(requested, dry_run=True),
+				persist=False,
+				walk_forward=False,
+			)
 		for name in ("trend", "rotation", "breakout", "dip"):
 			cached_scores = _cached_signal(f"signal_{name}", requested)
 			if cached_scores is not None:
@@ -496,7 +510,12 @@ def blend_scores(
 		for name in ("trend", "rotation", "breakout", "dip", "ml"):
 			cached_scores = _cached_signal(f"signal_{name}", requested)
 			function = getattr(signal_engine, f"signal_{name}")
-			score_map[name] = cached_scores if cached_scores is not None else function(requested)
+			if cached_scores is not None:
+				score_map[name] = cached_scores
+			elif name == "ml" and os.environ.get("MCP_SLOT", "am").lower() == "pm":
+				score_map[name] = function(requested, reuse_saved_model=True)
+			else:
+				score_map[name] = function(requested)
 		score_map["news"] = signal_engine.signal_news_tilt(
 			requested,
 			student=student,
