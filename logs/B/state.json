@@ -53,6 +53,20 @@
       "order_count": 7,
       "slot": "pm",
       "status": "completed"
+    },
+    "2026-10-22:pm": {
+      "date": "2026-10-22",
+      "drawdown_breaker": false,
+      "equity": 98204.75,
+      "mode": "live",
+      "order_cap": {
+        "applied": "normal",
+        "held_positions": 9,
+        "limit": 10
+      },
+      "order_count": 9,
+      "slot": "pm",
+      "status": "completed"
     }
   }
 }
