@@ -162,3 +162,7 @@
 {"fold": 2, "ic": 0.016621121493022833, "hit_rate": 0.5231739707835326, "train_rows": 66721, "test_rows": 15060, "signal_sign": 1, "model": "lightgbm_signal_20261027T141232551975Z.joblib"}
 {"fold": 3, "ic": 0.004467923735304879, "hit_rate": 0.5412429378531074, "train_rows": 81781, "test_rows": 15045, "signal_sign": 1, "model": "lightgbm_signal_20261027T141232551975Z.joblib"}
 {"event": "signal_sign_selected", "signal_sign": 1, "model": "lightgbm_signal_20261027T141232551975Z.joblib"}
+{"fold": 1, "ic": 0.031025244570360287, "hit_rate": 0.557413204325555, "train_rows": 45032, "test_rows": 14056, "signal_sign": 1, "model": "lightgbm_signal_20261027T141916339196Z.joblib"}
+{"fold": 2, "ic": 0.023660714512412556, "hit_rate": 0.545028917653539, "train_rows": 59088, "test_rows": 14524, "signal_sign": 1, "model": "lightgbm_signal_20261027T141916339196Z.joblib"}
+{"fold": 3, "ic": 0.004377399157598457, "hit_rate": 0.5514788966434031, "train_rows": 73607, "test_rows": 15045, "signal_sign": 1, "model": "lightgbm_signal_20261027T141916339196Z.joblib"}
+{"event": "signal_sign_selected", "signal_sign": 1, "model": "lightgbm_signal_20261027T141916339196Z.joblib"}
