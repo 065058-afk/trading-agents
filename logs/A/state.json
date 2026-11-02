@@ -1,5 +1,5 @@
 {
-  "peak_equity": 101127.38,
+  "peak_equity": 101130.79,
   "runs": {
     "2026-10-13": {
       "daily_order_cap": {
@@ -216,6 +216,20 @@
       "order_cap": {
         "applied": "normal",
         "held_positions": 6,
+        "limit": 10
+      },
+      "order_count": 10,
+      "slot": "pm",
+      "status": "completed"
+    },
+    "2026-11-02:pm": {
+      "date": "2026-11-02",
+      "drawdown_breaker": false,
+      "equity": 101130.79,
+      "mode": "live",
+      "order_cap": {
+        "applied": "normal",
+        "held_positions": 13,
         "limit": 10
       },
       "order_count": 10,
